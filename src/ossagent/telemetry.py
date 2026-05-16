@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -9,6 +10,8 @@ from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.outputs import LLMResult
 
 from ossagent.db import CostLedgerEntry, Database
+
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -34,30 +37,40 @@ class CostTracker(BaseCallbackHandler):
         self.model = model
 
     def on_llm_end(self, response: LLMResult, **kwargs: object) -> None:
-        usage = self._extract_usage(response)
-        if usage is None:
-            return
-        input_tokens, output_tokens = usage
-        price = MODEL_PRICING.get(self.model)
-        cost_usd = (
-            0.0
-            if price is None
-            else (input_tokens / 1_000_000) * price.input_per_1m
-            + (output_tokens / 1_000_000) * price.output_per_1m
-        )
-        self.db.add_cost(
-            CostLedgerEntry(
-                attempt_id=self.attempt_id,
-                role=self.role,
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-                cost_usd=cost_usd,
-                at=datetime.now(UTC),
+        # Telemetry must never break the chain it observes — swallow & log any
+        # storage failure so a transient sqlite issue can't derail an LLM call.
+        try:
+            usage = self._extract_usage(response)
+            if usage is None:
+                return
+            input_tokens, output_tokens = usage
+            price = MODEL_PRICING.get(self.model)
+            if price is None:
+                log.warning(
+                    "unknown model %r; recording zero cost (update MODEL_PRICING)",
+                    self.model,
+                )
+                cost_usd = 0.0
+            else:
+                cost_usd = (input_tokens / 1_000_000) * price.input_per_1m + (
+                    output_tokens / 1_000_000
+                ) * price.output_per_1m
+            self.db.add_cost(
+                CostLedgerEntry(
+                    attempt_id=self.attempt_id,
+                    role=self.role,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    cost_usd=cost_usd,
+                    at=datetime.now(UTC),
+                )
             )
-        )
+        except Exception:
+            log.exception("cost telemetry failed for attempt=%s", self.attempt_id)
 
     @staticmethod
     def _extract_usage(response: LLMResult) -> tuple[int, int] | None:
+        # Phase 1 assumption: one generation per call (Triager). Returns first hit.
         for gen_list in response.generations:
             for gen in gen_list:
                 msg = getattr(gen, "message", None)
