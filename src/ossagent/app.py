@@ -14,6 +14,9 @@ image = (
     .apt_install("git")
     # Modal 1.4+: bake the config dir into the image instead of using Mount.
     .add_local_dir("config", remote_path="/app/config")
+    # Ship the ossagent package itself; pip_install_from_pyproject only resolves
+    # external deps, not the project's own source tree.
+    .add_local_python_source("ossagent")
 )
 
 vol = modal.Volume.from_name("ossagent-data", create_if_missing=True)
