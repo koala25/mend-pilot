@@ -26,7 +26,12 @@ class GitHubClient:
     BASE = "https://api.github.com"
 
     def __init__(self, token: str | None = None) -> None:
-        self.token = token or os.environ["GITHUB_TOKEN"]
+        if token is None:
+            try:
+                token = os.environ["GITHUB_TOKEN"]
+            except KeyError as e:
+                raise RuntimeError("GITHUB_TOKEN is not set") from e
+        self.token = token
 
     def _headers(self) -> dict[str, str]:
         return {
