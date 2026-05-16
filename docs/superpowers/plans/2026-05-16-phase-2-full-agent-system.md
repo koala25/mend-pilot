@@ -26,7 +26,7 @@
 ## File Structure (after Phase 2)
 
 ```
-oss-pr-bot/
+mend-pilot/
 ├── pyproject.toml
 ├── .pre-commit-config.yaml
 ├── README.md
@@ -1159,7 +1159,7 @@ def make_critic_node(llm: BaseChatModel):
 DISCLOSURE = (
     "\n\n---\n"
     "_This PR was drafted by an automated agent ([ossagent]"
-    "(https://github.com/koala25/oss-pr-bot)). "
+    "(https://github.com/koala25/mend-pilot)). "
     "I reviewed the diff and tested it before submitting. "
     "Feedback on the agent's output is welcomed._\n"
 )
@@ -2662,7 +2662,7 @@ A LangGraph-orchestrated agent that drafts open-source contributions for review.
 
 The agent is a LangGraph state machine with conditional routing per issue classification. See [docs/architecture.md](docs/architecture.md) for the source.
 
-Key design choices and tradeoffs are documented in [the design spec](docs/superpowers/specs/2026-05-16-oss-pr-bot-design.md).
+Key design choices and tradeoffs are documented in [the design spec](docs/superpowers/specs/2026-05-16-mend-pilot-design.md).
 
 ## Operational characteristics
 
@@ -2777,7 +2777,7 @@ This becomes its own short plan.
 
 ## Self-Review Notes
 
-Coverage vs spec `2026-05-16-oss-pr-bot-design.md`:
+Coverage vs spec `2026-05-16-mend-pilot-design.md`:
 
 - ✅ §3 High-level architecture
 - ✅ §4 LangGraph — all 11 nodes wired across all 4 lanes (TYPO/DEPRECATION/TEST_GAP/BUG_FIX)

@@ -7,7 +7,7 @@ A multi-agent open-source contribution bot. **Phase 1: skeleton — polling and 
 Phase 1 deployed. Every 30 minutes the bot polls [`langchain-ai/langchain`](https://github.com/langchain-ai/langchain), classifies new issues with a cheap LLM (Moonshot's `moonshot-v1-8k`), and sends a Telegram message for any issue classified as a good candidate for automated fixing.
 
 Subsequent phases will add the LangGraph agent that drafts the fixes themselves. See
-[`docs/superpowers/specs/2026-05-16-oss-pr-bot-design.md`](docs/superpowers/specs/2026-05-16-oss-pr-bot-design.md)
+[`docs/superpowers/specs/2026-05-16-mend-pilot-design.md`](docs/superpowers/specs/2026-05-16-mend-pilot-design.md)
 for the full design, and [`docs/superpowers/plans/`](docs/superpowers/plans/) for the per-phase
 implementation plans.
 
@@ -111,7 +111,7 @@ See [`docs/superpowers/plans/2026-05-16-phase-2-full-agent-system.md`](docs/supe
 ## Repository layout
 
 ```
-oss-pr-bot/
+mend-pilot/
 ├── config/                    Provider + watched-repo configs (YAML)
 ├── src/ossagent/              Module-per-responsibility Python package
 ├── docs/superpowers/specs/    Design spec

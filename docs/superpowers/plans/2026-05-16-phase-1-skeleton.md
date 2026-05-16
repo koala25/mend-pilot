@@ -15,7 +15,7 @@
 ## File Structure
 
 ```
-oss-pr-bot/
+mend-pilot/
 ├── pyproject.toml                 # deps, ruff/mypy config
 ├── .pre-commit-config.yaml        # ruff + mypy gating
 ├── .gitignore
@@ -48,7 +48,7 @@ One file = one responsibility. Modal app code (`app.py`) stays thin — logic li
 - [ ] **Step 1: Create directory structure**
 
 ```bash
-cd /Users/kbtg/codebase/personal/oss-pr-bot
+cd /Users/kbtg/codebase/personal/mend-pilot
 mkdir -p src/ossagent config
 touch src/ossagent/__init__.py
 ```
@@ -1158,7 +1158,7 @@ A multi-agent open-source contribution bot. *Phase 1: skeleton — polling and t
 
 Phase 1 deployed: every 30 min the bot polls `langchain-ai/langchain` and classifies new issues with a cheap LLM. Issues classified as fit are sent to a Telegram chat for review.
 
-Subsequent phases will add the LangGraph agent that drafts fixes for fit issues. See `docs/superpowers/specs/2026-05-16-oss-pr-bot-design.md` for the full design.
+Subsequent phases will add the LangGraph agent that drafts fixes for fit issues. See `docs/superpowers/specs/2026-05-16-mend-pilot-design.md` for the full design.
 
 ## Architecture (Phase 1)
 
@@ -1211,7 +1211,7 @@ This is a separate plan; the Phase 1 system can be running while you write tests
 
 ## Self-Review Notes
 
-Coverage vs spec `2026-05-16-oss-pr-bot-design.md`:
+Coverage vs spec `2026-05-16-mend-pilot-design.md`:
 
 - ✅ §3 High-level architecture — scheduler implemented; worker (LangGraph) deferred to Phase 2.
 - ✅ §5 Two-stage triage — Stage 1 in this plan; Stage 2 in Phase 2.

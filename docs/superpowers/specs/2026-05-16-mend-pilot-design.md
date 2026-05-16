@@ -673,7 +673,7 @@ These should be resolved before or during implementation:
 4. **Critic confidence threshold** — currently 0.6. Will need tuning against real outputs. Set up to be configurable.
 5. **Disclosure footer wording** — exact phrasing of the AI-assisted PR disclosure. Draft: *"This PR was drafted by an automated agent ([repo link]). I reviewed the diff and tested it locally before submitting. Feedback on the agent's quality is welcomed."*
 6. **Final project name** — `ossagent` is a placeholder. Rename before public push.
-7. **Eval set publishing** — public dataset repo, or just the README? Recommendation: separate `oss-pr-bot-evals` repo, MIT-licensed.
+7. **Eval set publishing** — public dataset repo, or just the README? Recommendation: separate `mend-pilot-evals` repo, MIT-licensed.
 
 ---
 
