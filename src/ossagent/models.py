@@ -11,7 +11,19 @@ from langchain_openai import ChatOpenAI
 from ossagent.config import ModelSpec
 
 
+def _require_env(name: str, *, role: str, provider: str) -> str:
+    try:
+        return os.environ[name]
+    except KeyError as e:
+        raise RuntimeError(
+            f"{name} is not set (required for role={role!r}, provider={provider!r})"
+        ) from e
+
+
 def get_llm(role: str, *, config: dict[str, ModelSpec]) -> BaseChatModel:
+    """Return a chat model for the given role, looked up from `config`."""
+    if role not in config:
+        raise ValueError(f"Unknown role: {role!r}. Known roles: {sorted(config)}")
     spec = config[role]
     if spec.provider in ("moonshot", "openai"):
         api_key_env = {
@@ -20,14 +32,14 @@ def get_llm(role: str, *, config: dict[str, ModelSpec]) -> BaseChatModel:
         }[spec.provider]
         return ChatOpenAI(
             base_url=spec.api_base,
-            api_key=os.environ[api_key_env],
+            api_key=_require_env(api_key_env, role=role, provider=spec.provider),
             model=spec.model,
             temperature=spec.temperature,
             max_tokens=spec.max_tokens,
         )
     if spec.provider == "anthropic":
         return ChatAnthropic(
-            api_key=os.environ["ANTHROPIC_API_KEY"],
+            api_key=_require_env("ANTHROPIC_API_KEY", role=role, provider=spec.provider),
             model=spec.model,
             temperature=spec.temperature,
             max_tokens=spec.max_tokens,
