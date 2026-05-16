@@ -1,0 +1,15 @@
+defaults:
+  provider: moonshot
+  api_base: https://api.moonshot.cn/v1
+  model: kimi-latest       # PIN to exact identifier when you have it
+  temperature: 0.1
+  max_tokens: 2000
+
+roles:
+  triager:     { temperature: 0.0, max_tokens: 200 }
+  planner:     { temperature: 0.2, max_tokens: 1500 }
+  locator:     { temperature: 0.0, max_tokens: 800 }
+  implementer: { temperature: 0.2, max_tokens: 4000 }
+  tester:      { temperature: 0.1, max_tokens: 2000 }
+  critic:      { temperature: 0.2, max_tokens: 1500 }
+  pr_writer:   { temperature: 0.3, max_tokens: 1000 }
