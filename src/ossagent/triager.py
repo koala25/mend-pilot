@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -11,12 +12,15 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from ossagent.github_client import Issue
 
+log = logging.getLogger(__name__)
+
 
 class Classification(StrEnum):
     TYPO = "TYPO"
     DEPRECATION = "DEPRECATION"
     TEST_GAP = "TEST_GAP"
     BUG_FIX = "BUG_FIX"
+    UNCLASSIFIED = "UNCLASSIFIED"  # fallback when the LLM returns garbage
 
 
 @dataclass(frozen=True)
@@ -77,10 +81,15 @@ class Triager:
                 classification=Classification(data["class"]),
                 reason=str(data["reason"]),
             )
-        except (json.JSONDecodeError, KeyError, ValueError):
+        except (json.JSONDecodeError, KeyError, ValueError) as e:
+            log.warning(
+                "triager parse failed: %s; raw=%r",
+                e,
+                text[:500],
+            )
             return TriageVerdict(
                 fit=False,
                 confidence=0.0,
-                classification=Classification.BUG_FIX,
+                classification=Classification.UNCLASSIFIED,
                 reason="Triager returned malformed JSON; rejecting by default.",
             )
