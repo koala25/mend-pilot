@@ -41,12 +41,14 @@ async def poll_one_repo(
         if last_seen is not None and issue.number <= last_seen:
             skipped_seen += 1
             continue
-        max_seen = max(max_seen, issue.number)
         try:
             verdict = await triager.classify(issue)
         except Exception:
             log.exception("triage_failed", issue=issue.number)
+            # Do NOT advance the watermark — let the next poll retry this
+            # issue (e.g., a transient auth or rate-limit failure).
             continue
+        max_seen = max(max_seen, issue.number)
         log.info(
             "triaged",
             issue=issue.number,
