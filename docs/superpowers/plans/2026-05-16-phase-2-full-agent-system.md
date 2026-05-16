@@ -1707,9 +1707,6 @@ def push_and_open_pr_from_attempt(
         return None
     branch = branches[0].strip().lstrip("* ").strip()
 
-    # Push to our fork
-    git("push", "-u", "origin", branch, cwd=repo_path)
-
     # Read prepared PR title/body from a sidecar file (set by send_tg, see Task 16)
     sidecar = data_dir / "drafts" / attempt_id / "pr.json"
     import json
@@ -1717,6 +1714,15 @@ def push_and_open_pr_from_attempt(
     pr_title = meta["title"]
     pr_body = meta["body"]
     base_branch = meta["base_branch"]
+
+    # The agent's enforce_style + add_test nodes left changes in the working
+    # tree. Commit them now using the PR title as the commit message — this
+    # makes the branch fast-forward-able and the eventual squash-merge clean.
+    from ossagent.agent.tools import stage_and_commit
+    stage_and_commit(repo_path, pr_title)
+
+    # Push to our fork
+    git("push", "-u", "origin", branch, cwd=repo_path)
 
     upstream = f"{owner}/{name}"
     proc = subprocess.run(
