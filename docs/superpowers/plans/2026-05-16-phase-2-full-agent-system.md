@@ -1155,23 +1155,88 @@ def make_critic_node(llm: BaseChatModel):
 
 
 # ── prepare_pr node ─────────────────────────────────────────────────────
+#
+# Two LLM passes. First writes the PR; second rewrites the body to strip
+# AI-tell stylistics. NEVER mention this project, "agent", "automation", or
+# similar in the output — author the PR as the human reviewer.
 
-DISCLOSURE = (
-    "\n\n---\n"
-    "_This PR was drafted by an automated agent ([ossagent]"
-    "(https://github.com/koala25/mend-pilot)). "
-    "I reviewed the diff and tested it before submitting. "
-    "Feedback on the agent's output is welcomed._\n"
-)
 
-PR_WRITER_SYSTEM = """You write the PR title and body for an automated fix.
+PR_WRITER_SYSTEM = """Write the title and body for a GitHub pull request.
 
-Use conventional-commits style for the title.
+You will be given: the issue this PR addresses, the diff, test results, and
+(if present) the repo's PR template.
 
-If a PR template is provided, fill it VERBATIM. Otherwise include: issue link,
-summary, test plan, confidence.
+VOICE — read carefully. The PR should read as if a senior developer wrote it
+after thirty minutes of investigation. Be specific and technical. Skip filler.
 
-Reply STRICT JSON: {"title": "<title>", "body": "<full body>"}
+NEVER include any of these words anywhere in title or body:
+  automated, agent, bot, AI, LLM, drafted, generated, Claude, Kimi, Moonshot,
+  ossagent, mend-pilot, assistant. Do not refer to "the tool" or "this script"
+  as the author of the change. The reviewer is the author.
+
+NEVER use these stylistic crutches:
+  Em dashes. Use commas, periods, or parentheses.
+  Words: leverage, robust, comprehensive, delve, underscore, showcase, ensure,
+    foster, seamless, vital, crucial, pivotal, harness, streamline.
+  -ing tails adding fake depth ("highlighting that", "ensuring X").
+  "Not only X but Y" or "It's not just about X, it's Y".
+  Triple lists where two would do.
+  Emojis.
+  Bolded inline headers like **Summary:** or **Test plan:** in body prose.
+  Sycophantic closers ("I hope this helps", "Happy to iterate").
+  Curly quotes.
+  Title Case Section Headings (use sentence case).
+
+CONTENT the body MUST include:
+  - A link to the issue. Use `Closes #N` if same repo, full URL otherwise.
+  - One sentence describing what the diff does.
+  - Two to four sentences on WHY this fix and not an alternative: the root
+    cause, what made it surface, what else was considered and rejected.
+  - A short concrete verification section: which existing or new tests cover
+    this, and the exact pytest invocation that was run.
+  - If the repo's PR template is provided, fill ITS sections; do not invent
+    headings that aren't in the template.
+
+TITLE: conventional-commits style, lowercase subject, no trailing period.
+Examples:
+  fix(runnables): replace deprecated Runnable.run() with .invoke()
+  docs: correct typo in tool-calling guide
+
+BODY length: 80-250 words. Less is fine for trivial changes.
+
+VOICE cues:
+  Short, declarative sentences.
+  First person is fine: "I noticed", "I tried X first", "I think".
+  Specifics over abstractions. Function names, file paths, error messages,
+    test names beat generic claims about "the change".
+
+Reply STRICT JSON: {"title": "<title>", "body": "<markdown body>"}
+"""
+
+
+HUMANIZER_SYSTEM = """You are an editor stripping signs of AI authorship from
+a draft pull-request description. Apply these rewrites:
+
+  Replace any em dashes with commas, periods, or parentheses.
+  Remove or rephrase to drop these words: leverage, robust, comprehensive,
+    delve, underscore, showcase, ensure, foster, seamless, vital, crucial,
+    pivotal, harness, streamline, automated, AI, agent, bot, drafted,
+    generated, Claude, Kimi, Moonshot, ossagent, mend-pilot, assistant.
+  Remove -ing tail clauses adding fake depth ("highlighting that", "ensuring
+    X", "underscoring its importance").
+  Remove "not only/but also" and "it's not just/it's" constructions.
+  Collapse triple lists where two items already convey the point.
+  Remove emoji.
+  Convert bolded inline headers (**Foo:**) to plain prose.
+  Remove sycophantic closers.
+  Sentence-case any headings (not Title Case).
+  Replace curly quotes with straight ones.
+
+KEEP all technical content unchanged: file paths, function names, line
+numbers, test names, error messages, the issue link, the description of what
+the diff does. Do not invent or remove technical claims.
+
+Reply with just the rewritten body. No JSON, no commentary, no code fences.
 """
 
 
@@ -1180,35 +1245,57 @@ def make_prepare_pr_node(llm: BaseChatModel, *, our_login: str):
         issue = state["issue"]
         ctx: RepoContext = state["repo_context"]
         tr: TestRunResult = state["test_run"]
-        user = (
+
+        # Pass 1 — write the PR.
+        writer_input = (
             f"# Issue URL\n{issue.html_url}\n\n"
             f"# Issue title\n{issue.title}\n\n"
+            f"# Issue body excerpt\n{issue.body[:1500]}\n\n"
             f"# Diff\n```\n{state.get('patch', '')[:6000]}\n```\n\n"
-            f"# Tests\npassed={tr.passed} failed={tr.failed_tests}\n\n"
-            f"# Critic\n{state.get('critic_reasoning', '')}\n"
-            f"confidence={state.get('confidence', 0.0)}\n\n"
-            f"# PR template\n{ctx.pr_template or '(none)'}\n\n"
-            f"# PR norms\n{chr(10).join('- ' + n for n in ctx.pr_norms[:4]) or '(none)'}\n"
+            f"# Tests\npassed={tr.passed} failed={tr.failed_tests}\n"
+            f"stdout_tail:\n{tr.stdout_tail[-800:]}\n\n"
+            f"# PR template (verbatim from repo, fill as-is if present)\n"
+            f"{ctx.pr_template or '(none)'}\n\n"
+            f"# PR norms\n"
+            f"{chr(10).join('- ' + n for n in ctx.pr_norms[:4]) or '(none)'}\n"
         )
-        msg = await llm.ainvoke([
+        write_msg = await llm.ainvoke([
             SystemMessage(content=PR_WRITER_SYSTEM),
-            HumanMessage(content=user),
+            HumanMessage(content=writer_input),
         ])
         try:
-            data = json.loads(msg.content)
+            data = json.loads(write_msg.content)
             title = str(data["title"])
-            body = str(data["body"]) + DISCLOSURE
+            draft_body = str(data["body"])
         except (json.JSONDecodeError, KeyError, ValueError):
-            title = f"fix: {issue.title[:60]}"
-            body = f"Closes {issue.html_url}\n{DISCLOSURE}"
-        branch = f"ossagent/{issue.number}-{state['attempt_id'][:8]}"
-        # Determine base branch from repo_url (best-effort default)
+            # Generic minimal fallback. Never mentions our tooling.
+            title = _fallback_title(issue.title)
+            draft_body = (
+                f"Closes {issue.html_url}\n\n"
+                "Reviewed locally before submitting."
+            )
+
+        # Pass 2 — humanizer pass on the body. The title is already
+        # constrained to conventional-commits style by the writer prompt.
+        humanize_msg = await llm.ainvoke([
+            SystemMessage(content=HUMANIZER_SYSTEM),
+            HumanMessage(content=draft_body),
+        ])
+        body = (humanize_msg.content or draft_body).strip()
+
+        branch = f"fix/issue-{issue.number}-{state['attempt_id'][:8]}"
         base_branch = "master" if ctx.repo_owner in {"langchain-ai", "tiangolo"} else "main"
         return {"pr_metadata": PRMetadata(
             title=title, body=body, branch_name=branch,
             head_owner=our_login, base_branch=base_branch,
         )}
     return prepare_pr_node
+
+
+def _fallback_title(issue_title: str) -> str:
+    """Conventional-commits-style title derived from the issue title."""
+    cleaned = issue_title.strip().rstrip(".").lower()[:60]
+    return f"fix: {cleaned}"
 
 
 # ── send_tg node ────────────────────────────────────────────────────────
@@ -1494,7 +1581,7 @@ async def process_issue(
 
     repo_path = data_dir / "repos" / owner / name
     shallow_clone_or_pull(f"https://github.com/{owner}/{name}.git", repo_path)
-    create_branch(repo_path, f"ossagent/{number}-{attempt_id[:8]}")
+    create_branch(repo_path, f"fix/issue-{number}-{attempt_id[:8]}")
 
     models = load_models_config(config_dir / "models.yaml")
     extractor_llm = get_llm("planner", config=models)  # cheap-ish role for extraction
@@ -1594,7 +1681,7 @@ def push_and_open_pr_from_attempt(
     db = Database(db_path)
     # Read attempt + branch info from DB or filesystem cache.
     # The branch lives in /data/repos/<owner>/<name> on a branch named
-    # `ossagent/<issue#>-<attempt_id[:8]>`.
+    # `fix/issue-<issue#>-<attempt_id[:8]>`.
 
     # Look up the attempt
     import sqlite3
@@ -1612,7 +1699,7 @@ def push_and_open_pr_from_attempt(
     repo_path = data_dir / "repos" / owner / name
     # Find the branch by attempt_id prefix
     branches = subprocess.run(
-        ["git", "branch", "--list", f"ossagent/*{attempt_id[:8]}*"],
+        ["git", "branch", "--list", f"fix/issue-*{attempt_id[:8]}*"],
         cwd=repo_path, capture_output=True, text=True, check=True,
     ).stdout.strip().splitlines()
     if not branches:
@@ -1814,7 +1901,7 @@ def cleanup_stale_drafts(db_path: Path, data_dir: Path) -> None:
         if repo_path.exists():
             # Delete the stale branch (best-effort)
             subprocess.run(
-                ["git", "branch", "-D", f"ossagent/*{aid[:8]}*"],
+                ["git", "branch", "-D", f"fix/issue-*{aid[:8]}*"],
                 cwd=repo_path, capture_output=True, check=False,
             )
         with sqlite3.connect(db_path) as c:
