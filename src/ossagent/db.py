@@ -4,9 +4,38 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
+
+
+def _adapt_datetime(dt: datetime) -> str:
+    """Store all datetimes as ISO-8601 UTC strings; reject naive datetimes."""
+    if dt.tzinfo is None:
+        raise ValueError("naive datetime cannot be stored; pass tz-aware UTC values")
+    return dt.astimezone(UTC).isoformat()
+
+
+def _convert_timestamp(value: bytes) -> datetime:
+    """Read TIMESTAMP columns back as tz-aware UTC datetimes."""
+    return datetime.fromisoformat(value.decode()).astimezone(UTC)
+
+
+# Override the stdlib defaults, which are deprecated in 3.12 and TZ-lossy.
+sqlite3.register_adapter(datetime, _adapt_datetime)
+sqlite3.register_converter("TIMESTAMP", _convert_timestamp)
+
+
+def _utc_today_start() -> datetime:
+    """Midnight today in UTC (not local time)."""
+    now = datetime.now(UTC)
+    return now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def _utc_month_start() -> datetime:
+    """First moment of the current UTC month."""
+    now = datetime.now(UTC)
+    return now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
 
 
 class AttemptStatus(StrEnum):
@@ -110,6 +139,7 @@ class Database:
             )
 
     def fetch_attempt_by_issue(self, issue_url: str) -> Attempt | None:
+        """Return the most recently started attempt for an issue, or None."""
         with self._conn() as c:
             row = c.execute(
                 "SELECT * FROM attempts WHERE issue_url = ? ORDER BY started_at DESC LIMIT 1",
@@ -129,7 +159,7 @@ class Database:
         )
 
     def repo_attempts_today(self, owner: str, name: str) -> int:
-        today_start = datetime.combine(date.today(), datetime.min.time(), UTC)
+        today_start = _utc_today_start()
         with self._conn() as c:
             row = c.execute(
                 """
@@ -152,7 +182,7 @@ class Database:
             )
 
     def cost_today(self) -> float:
-        today_start = datetime.combine(date.today(), datetime.min.time(), UTC)
+        today_start = _utc_today_start()
         with self._conn() as c:
             row = c.execute(
                 "SELECT COALESCE(SUM(cost_usd), 0) AS s FROM cost_ledger WHERE at >= ?",
@@ -161,7 +191,7 @@ class Database:
         return float(row["s"])
 
     def cost_month_to_date(self) -> float:
-        month_start = datetime(date.today().year, date.today().month, 1, tzinfo=UTC)
+        month_start = _utc_month_start()
         with self._conn() as c:
             row = c.execute(
                 "SELECT COALESCE(SUM(cost_usd), 0) AS s FROM cost_ledger WHERE at >= ?",
