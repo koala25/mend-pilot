@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from typing import Any
 
 import httpx
 
@@ -63,7 +64,7 @@ class GitHubClient:
             return self._to_issue(r.json())
 
     @staticmethod
-    def _to_issue(d: dict) -> Issue:
+    def _to_issue(d: dict[str, Any]) -> Issue:
         return Issue(
             number=d["number"],
             title=d["title"],

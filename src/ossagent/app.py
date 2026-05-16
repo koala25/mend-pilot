@@ -23,7 +23,7 @@ CONFIG_MOUNT_PATH = Path("/app/config")
 DB_PATH = Path("/data/attempts.db")
 
 
-@app.function(
+@app.function(  # type: ignore[misc]  # modal decorator is untyped
     image=image,
     schedule=modal.Period(minutes=30),
     cpu=0.5,
@@ -64,7 +64,7 @@ async def poll_repos() -> None:
             log.exception("poll_failed", repo=f"{repo.owner}/{repo.name}", error=str(e))
 
 
-@app.local_entrypoint()
+@app.local_entrypoint()  # type: ignore[misc]  # modal decorator is untyped
 def main() -> None:
     """Manual trigger for testing: `modal run src/ossagent/app.py`."""
     poll_repos.remote()

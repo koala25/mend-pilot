@@ -29,7 +29,7 @@ MODEL_PRICING: dict[str, ModelPrice] = {
 }
 
 
-class CostTracker(BaseCallbackHandler):
+class CostTracker(BaseCallbackHandler):  # type: ignore[misc]  # langchain BaseCallbackHandler typed as Any
     def __init__(self, db: Database, attempt_id: str, role: str, model: str) -> None:
         self.db = db
         self.attempt_id = attempt_id
