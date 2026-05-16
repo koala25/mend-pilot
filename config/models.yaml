@@ -1,7 +1,11 @@
 defaults:
+  # Phase 1 default: moonshot-v1-8k — cheap, supports temperature=0 (needed
+  # for strict-JSON triage). kimi-k2.5 / kimi-k2.6 are more capable but FORCE
+  # temperature=1; use those as per-role overrides for planner/implementer
+  # in Phase 2 where some sampling is acceptable.
   provider: moonshot
   api_base: https://api.moonshot.ai/v1
-  model: kimi-latest       # PIN to exact identifier when you have it
+  model: moonshot-v1-8k
   temperature: 0.1
   max_tokens: 2000
 

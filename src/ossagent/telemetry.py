@@ -20,9 +20,14 @@ class ModelPrice:
     output_per_1m: float
 
 
-# Pin from provider docs at deploy time.
+# Pin from provider docs at deploy time. Moonshot prices are estimates from
+# api.moonshot.ai 2026-05; verify on the billing dashboard.
 MODEL_PRICING: dict[str, ModelPrice] = {
-    "kimi-latest": ModelPrice(input_per_1m=0.30, output_per_1m=1.50),
+    "moonshot-v1-8k": ModelPrice(input_per_1m=0.12, output_per_1m=0.12),
+    "moonshot-v1-32k": ModelPrice(input_per_1m=0.24, output_per_1m=0.24),
+    "moonshot-v1-128k": ModelPrice(input_per_1m=0.60, output_per_1m=0.60),
+    "kimi-k2.5": ModelPrice(input_per_1m=0.60, output_per_1m=2.50),
+    "kimi-k2.6": ModelPrice(input_per_1m=0.60, output_per_1m=2.50),
     "claude-haiku-4-5": ModelPrice(input_per_1m=0.80, output_per_1m=4.00),
     "claude-sonnet-4-6": ModelPrice(input_per_1m=3.00, output_per_1m=15.00),
     "claude-opus-4-7": ModelPrice(input_per_1m=15.00, output_per_1m=75.00),
