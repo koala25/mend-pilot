@@ -1,13 +1,20 @@
 """Load and validate YAML configuration files."""
+
 from __future__ import annotations
+
 from dataclasses import dataclass
 from pathlib import Path
+
 import yaml
 
-
 REQUIRED_ROLES = (
-    "triager", "planner", "locator", "implementer",
-    "tester", "critic", "pr_writer",
+    "triager",
+    "planner",
+    "locator",
+    "implementer",
+    "tester",
+    "critic",
+    "pr_writer",
 )
 
 
@@ -50,7 +57,8 @@ def load_watched_repos_config(path: Path) -> list[WatchedRepo]:
     raw = yaml.safe_load(path.read_text())
     return [
         WatchedRepo(
-            owner=r["owner"], name=r["name"],
+            owner=r["owner"],
+            name=r["name"],
             default_branch=r.get("default_branch", "main"),
         )
         for r in raw["repos"]
