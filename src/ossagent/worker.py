@@ -116,6 +116,7 @@ async def process_issue(
         telegram_bot=telegram_bot,
         our_login=our_login,
         checkpoint_db=data_dir / "checkpoints.db",
+        data_dir=data_dir,
     )
     try:
         final_state = await graph.ainvoke(

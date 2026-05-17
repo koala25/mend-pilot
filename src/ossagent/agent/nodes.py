@@ -6,6 +6,7 @@ import json
 import re
 import subprocess
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import Any
 
 from langchain_core.language_models import BaseChatModel
@@ -627,11 +628,29 @@ def _fallback_title(issue_title: str) -> str:
 # ── send_tg node ────────────────────────────────────────────────────────
 
 
-def make_send_tg_node(telegram_bot: TelegramBot) -> NodeFn:
+def make_send_tg_node(telegram_bot: TelegramBot, *, data_dir: Path) -> NodeFn:
     async def send_tg_node(state: AgentState) -> dict[str, Any]:
         pr = state["pr_metadata"]
+        attempt_id = state["attempt_id"]
+        # Sidecar lets push_and_open_pr (separate Modal function) reconstruct
+        # the prepared title, body, and base branch without needing the graph
+        # checkpoint.
+        sidecar_dir = data_dir / "drafts" / attempt_id
+        sidecar_dir.mkdir(parents=True, exist_ok=True)
+        (sidecar_dir / "pr.json").write_text(
+            json.dumps(
+                {
+                    "title": pr.title,
+                    "body": pr.body,
+                    "base_branch": pr.base_branch,
+                    "branch_name": pr.branch_name,
+                    "head_owner": pr.head_owner,
+                },
+                indent=2,
+            )
+        )
         await telegram_bot.send_draft_for_approval(
-            attempt_id=state["attempt_id"],
+            attempt_id=attempt_id,
             issue_url=state["issue"].html_url,
             issue_title=state["issue"].title,
             classification=state["classification"],

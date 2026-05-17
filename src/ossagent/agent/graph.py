@@ -37,6 +37,7 @@ def build_graph(
     telegram_bot: TelegramBot,
     our_login: str,
     checkpoint_db: Path,
+    data_dir: Path,
 ) -> CompiledStateGraph:
     g: StateGraph = StateGraph(AgentState)
 
@@ -49,7 +50,7 @@ def build_graph(
     g.add_node("run_tests", make_run_tests_node())
     g.add_node("critic", make_critic_node(llms["critic"]))
     g.add_node("prepare_pr", make_prepare_pr_node(llms["pr_writer"], our_login=our_login))
-    g.add_node("send_tg", make_send_tg_node(telegram_bot))
+    g.add_node("send_tg", make_send_tg_node(telegram_bot, data_dir=data_dir))
     g.add_node("log_skip", _noop)
 
     g.set_entry_point("plan")
