@@ -13,8 +13,14 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from ossagent.agent.ast_locator import find_python_symbol
 from ossagent.agent.context import RepoContext
-from ossagent.agent.state import AgentState, PlanStep, TargetFile
-from ossagent.agent.tools import read_file_window, ripgrep
+from ossagent.agent.state import (
+    AgentState,
+    PlanStep,
+    StyleViolation,
+    TargetFile,
+    TestRunResult,
+)
+from ossagent.agent.tools import apply_unified_diff, read_file_window, ripgrep
 
 NodeFn = Callable[[AgentState], Awaitable[dict[str, Any]]]
 
@@ -297,3 +303,109 @@ def make_add_test_node(llm: BaseChatModel) -> NodeFn:
         return {}
 
     return add_test_node
+
+
+# ── enforce_style node (deterministic) ──────────────────────────────────
+
+
+def make_enforce_style_node() -> NodeFn:
+    async def enforce_style_node(state: AgentState) -> dict[str, Any]:
+        repo_path = state["repo_path"]
+        patch = state.get("patch", "")
+        if not patch:
+            return {"style_violations": [], "skip_reason": "no_patch"}
+        try:
+            apply_unified_diff(repo_path, patch)
+        except RuntimeError as e:
+            return {
+                "style_violations": [
+                    StyleViolation(tool="git-apply", file="(diff)", message=str(e))
+                ],
+                "style_retry_count": state.get("style_retry_count", 0) + 1,
+            }
+        diff_files = subprocess.run(
+            ["git", "diff", "--name-only"],
+            cwd=repo_path,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.splitlines()
+        violations: list[StyleViolation] = []
+        if diff_files:
+            subprocess.run(
+                ["ruff", "check", "--fix", "--exit-zero", *diff_files],
+                cwd=repo_path,
+                timeout=60,
+            )
+            subprocess.run(["ruff", "format", *diff_files], cwd=repo_path, timeout=60)
+            remaining = subprocess.run(
+                ["ruff", "check", *diff_files],
+                cwd=repo_path,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            if remaining.returncode != 0:
+                for line in (remaining.stdout or "").splitlines():
+                    if ":" in line:
+                        path, _, message = line.partition(":")
+                        violations.append(
+                            StyleViolation(tool="ruff", file=path.strip(), message=message.strip())
+                        )
+        return {
+            "style_violations": violations,
+            "style_retry_count": state.get("style_retry_count", 0) + (1 if violations else 0),
+        }
+
+    return enforce_style_node
+
+
+# ── run_tests node ──────────────────────────────────────────────────────
+
+
+def make_run_tests_node() -> NodeFn:
+    async def run_tests_node(state: AgentState) -> dict[str, Any]:
+        repo_path = state["repo_path"]
+        diff_files = subprocess.run(
+            ["git", "diff", "--name-only"],
+            cwd=repo_path,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.splitlines()
+        targets: list[str] = []
+        for f in diff_files:
+            module = f.replace("/", ".").removesuffix(".py")
+            targets.extend(_find_related_tests(repo_path, module))
+        # Always include the failing-test path if reproducer wrote one.
+        failing = state.get("failing_test_path")
+        if failing:
+            targets.append(failing)
+        if not targets:
+            targets = ["tests/"]
+        proc = subprocess.run(
+            ["pytest", "-x", "--timeout=60", "-q", *targets],
+            cwd=repo_path,
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        passed = proc.returncode == 0
+        failed = [line.strip() for line in (proc.stdout or "").splitlines() if "FAILED" in line]
+        return {
+            "test_run": TestRunResult(
+                passed=passed,
+                failed_tests=failed[:10],
+                stdout_tail=(proc.stdout or "")[-2000:],
+                stderr_tail=(proc.stderr or "")[-1000:],
+            )
+        }
+
+    return run_tests_node
+
+
+def _find_related_tests(repo_path: Any, module_dotted: str) -> list[str]:
+    base = module_dotted.split(".")[-1]
+    if not base:
+        return []
+    return [str(p.relative_to(repo_path)) for p in repo_path.glob(f"tests/**/test_{base}.py")]
