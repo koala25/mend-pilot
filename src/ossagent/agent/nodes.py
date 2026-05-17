@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -133,3 +134,65 @@ def _extract_keywords(text: str) -> list[str]:
             seen.add(k)
             out.append(k)
     return out
+
+
+# ── reproduce node (BUG_FIX only) ───────────────────────────────────────
+
+REPRODUCE_SYSTEM = """You are the Reproducer. Given a bug report, write a
+pytest test that DEMONSTRATES the bug — it must FAIL on the current code.
+
+Output STRICT JSON:
+{"test_path": "tests/<test_filename>.py",
+ "test_code": "<full file contents>"}
+"""
+
+
+def make_reproduce_node(llm: BaseChatModel) -> NodeFn:
+    async def reproduce_node(state: AgentState) -> dict[str, Any]:
+        issue = state["issue"]
+        targets = state.get("target_files") or []
+        target: TargetFile | None = targets[0] if targets else None
+        target_summary = (
+            "(none)"
+            if target is None
+            else f"{target.path} lines {target.line_range[0]}-{target.line_range[1]}: {target.why}"
+        )
+        user = (
+            f"# Bug report\n{issue.title}\n\n{issue.body[:3000]}\n\n"
+            f"# Target file\n{target_summary}\n"
+        )
+        msg = await llm.ainvoke(
+            [
+                SystemMessage(content=REPRODUCE_SYSTEM),
+                HumanMessage(content=user),
+            ]
+        )
+        try:
+            data = json.loads(_as_text(msg.content))
+            test_path = str(data["test_path"])
+            test_code = str(data["test_code"])
+        except (json.JSONDecodeError, KeyError, ValueError):
+            return {"skip_reason": "reproduce_parse_failed"}
+
+        repo_path = state["repo_path"]
+        target_path = repo_path / test_path
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        target_path.write_text(test_code)
+
+        proc = subprocess.run(
+            ["pytest", "-x", "--timeout=60", "-q", test_path],
+            cwd=repo_path,
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+        if proc.returncode == 0:
+            # Test passed — bug NOT demonstrated. ABORT.
+            target_path.unlink(missing_ok=True)
+            return {"skip_reason": "could_not_reproduce_bug"}
+        return {
+            "failing_test_path": test_path,
+            "failing_test_output": (proc.stdout or "")[-2000:],
+        }
+
+    return reproduce_node
