@@ -1,16 +1,18 @@
-# Phase 2 — Full Agent System Implementation Plan (no-TDD edition)
+# Phase 2 — Working Agent + Real Draft PRs (no-TDD edition)
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Extend Phase 1 with the complete agent system: LangGraph orchestration of all 4 lanes (TYPO / DEPRECATION / TEST_GAP / BUG_FIX), AST-based code locator (tree-sitter), `reproduce` and `add_test` nodes, deterministic style enforcement, Critic with refusal, Telegram single-click approval, GitHub draft PR opening, daily PR status sync, stale draft cleanup, evaluation harness with single-shot baseline, and a recruiter-grade README with real numbers.
+**Goal:** Extend Phase 1 with the complete agent flow that drafts real PRs end-to-end: LangGraph orchestration of all 4 lanes (TYPO / DEPRECATION / TEST_GAP / BUG_FIX), AST-based code locator (tree-sitter), `reproduce` and `add_test` nodes, deterministic style enforcement, Critic with refusal, Telegram single-click approval, GitHub draft PR opening, daily PR status sync, and stale draft cleanup.
 
-**Architecture:** Modal worker (`process_issue`) with budget/idempotency guards → LangGraph state machine of 11 nodes (load_context → plan → locate → reproduce? → implement → add_test? → enforce_style → run_tests → critic → prepare_pr → send_tg) → Telegram webhook for callbacks → `push_and_open_pr` after approval. Two daily crons: PR status sync (for headline merge-rate metric) and stale-draft cleanup. A separate eval pipeline runs the agent against a 100-PR labeled set and produces a metrics report.
+**End state:** you tap "Approve" on a Telegram message and a real GitHub draft PR appears on the upstream repo, authored under your `koala25` identity, with a humanized body that doesn't read as AI-generated.
 
-**Tech Stack additions:** LangGraph 0.2+, tree-sitter + tree-sitter-python, `gh` CLI, ripgrep, subprocess pytest, scrape-and-replay eval harness.
+**Architecture:** Modal worker (`process_issue`) with budget/idempotency guards → LangGraph state machine of 11 nodes (load_context → plan → locate → reproduce? → implement → add_test? → enforce_style → run_tests → critic → prepare_pr → send_tg) → Telegram webhook for callbacks → `push_and_open_pr` after approval. Two daily crons: PR status sync (so the merge-rate metric updates automatically) and stale-draft cleanup.
 
-**Scope:** Everything from the spec's roadmap Phase 2-5 in one plan. **25 tasks.** Without TDD this is feasible across ~4-6 weekends of focused work.
+**Tech Stack additions:** LangGraph 0.2+, tree-sitter + tree-sitter-python, `gh` CLI, ripgrep, subprocess pytest, PyGithub.
 
-**Testing policy:** No unit tests written in this plan — deferred to a Phase 2.5 hardening pass after end-to-end runs. Each task verifies via import check, lint, and integration smoke test.
+**Scope:** Working flow only. The eval harness + headline numbers + demo video + final polish are **Phase 3** (`2026-05-17-phase-3-eval-and-polish.md`). **17 tasks here**, feasible across ~3-4 weekends of focused work.
+
+**Testing policy:** No unit tests in this plan. Each task verifies via import check, lint, and the end-of-plan smoke test on a real LangChain issue. Tests deferred to a Phase 2.5 hardening pass.
 
 ---
 
@@ -33,28 +35,24 @@ mend-pilot/
 ├── config/
 │   ├── models.yaml
 │   └── watched_repos.yaml
-├── docs/
-│   └── architecture.png         # generated in Task 25
-├── eval/
-│   ├── dataset.jsonl            # 100 labeled examples (Task 21)
-│   ├── runner.py                # eval entry point (Task 22)
-│   └── baseline.py              # single-shot baseline (Task 23)
 └── src/ossagent/
     ├── (Phase 1 files)
     ├── agent/
     │   ├── __init__.py
     │   ├── state.py
     │   ├── context.py
-    │   ├── context_extractor.py    # LLM convention extraction (Task 18)
+    │   ├── context_extractor.py    # LLM convention extraction (Task 6)
     │   ├── tools.py
-    │   ├── ast_locator.py          # tree-sitter AST queries (Task 13)
+    │   ├── ast_locator.py          # tree-sitter AST queries (Task 4)
     │   ├── nodes.py                # all 11 node functions
     │   └── graph.py
     ├── worker.py
     ├── webhook.py
     ├── pr_creator.py
-    └── crons.py                    # daily PR sync, stale cleanup (Tasks 19-20)
+    └── crons.py                    # daily PR sync, stale cleanup (Task 15)
 ```
+
+The `eval/` directory and `docs/architecture.png` are added in Phase 3.
 
 ---
 
@@ -2128,739 +2126,129 @@ Watch Modal dashboard logs through the full pipeline. Telegram message arrives. 
 
 ---
 
-## Task 18: Eval dataset scraper
-
-**Files:**
-- Create: `eval/dataset.py`
-
-- [ ] **Step 1: Create eval dir**
-
-```bash
-mkdir -p eval
-```
-
-- [ ] **Step 2: Write `eval/dataset.py`**
-
-```python
-"""Scrape merged PRs from watched repos to build a labeled eval set.
-
-Usage:
-    python eval/dataset.py langchain-ai/langchain --since 2025-01-01 --max 60
-"""
-from __future__ import annotations
-import argparse
-import json
-import os
-import time
-from pathlib import Path
-from github import Github
-
-
-def main() -> None:
-    p = argparse.ArgumentParser()
-    p.add_argument("repo", help="owner/name")
-    p.add_argument("--since", default="2025-01-01")
-    p.add_argument("--max", type=int, default=60)
-    p.add_argument("--out", default="eval/dataset.jsonl")
-    args = p.parse_args()
-
-    gh = Github(os.environ["GITHUB_TOKEN"])
-    repo = gh.get_repo(args.repo)
-    out_path = Path(args.out)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    n_written = 0
-    with out_path.open("a") as f:
-        # Iterate closed (merged) PRs newest-first
-        for pr in repo.get_pulls(state="closed", sort="created", direction="desc"):
-            if not pr.merged:
-                continue
-            if pr.created_at.isoformat() < args.since:
-                break
-            if pr.changed_files != 1:
-                continue
-            issue_url = _linked_issue_url(pr)
-            if not issue_url:
-                continue
-            # Fetch the linked issue
-            try:
-                issue_number = int(issue_url.rstrip("/").split("/")[-1])
-                issue = repo.get_issue(issue_number)
-            except Exception:
-                continue
-            record = {
-                "issue_url": issue_url,
-                "issue_title": issue.title,
-                "issue_body": issue.body or "",
-                "pr_url": pr.html_url,
-                "pr_diff_url": pr.diff_url,
-                "merged_at": pr.merged_at.isoformat(),
-                "labels": [lbl.name for lbl in issue.labels],
-                "true_classification": None,   # fill in manually
-            }
-            f.write(json.dumps(record) + "\n")
-            n_written += 1
-            if n_written >= args.max:
-                break
-            time.sleep(0.5)   # be polite to GitHub API
-    print(f"wrote {n_written} records to {out_path}")
-
-
-def _linked_issue_url(pr) -> str | None:
-    """Find 'Closes #N' or 'Fixes #N' references in the PR body."""
-    import re
-    body = pr.body or ""
-    m = re.search(r"(?:closes|fixes|resolves)\s+#(\d+)", body, re.IGNORECASE)
-    if m:
-        return f"{pr.base.repo.html_url}/issues/{m.group(1)}"
-    return None
-
-
-if __name__ == "__main__":
-    main()
-```
-
-- [ ] **Step 3: Run to bootstrap an eval set**
-
-```bash
-.venv/bin/python eval/dataset.py langchain-ai/langchain --since 2025-06-01 --max 50
-.venv/bin/python eval/dataset.py tiangolo/fastapi --since 2025-06-01 --max 50
-```
-
-Then manually annotate the `true_classification` field for each row (TYPO / DEPRECATION / TEST_GAP / BUG_FIX). Aim for ~25 per class. Save the annotated version as `eval/dataset.jsonl`.
-
-- [ ] **Step 4: Commit**
-
-```bash
-git add eval/dataset.py
-git commit -m "feat(eval): GitHub scraper for labeled eval set"
-```
-
-After labeling:
-
-```bash
-git add eval/dataset.jsonl
-git commit -m "data: 100-PR labeled eval set across LangChain + FastAPI"
-```
-
----
-
-## Task 19: Eval runner
-
-**Files:**
-- Create: `eval/runner.py`
-
-- [ ] **Step 1: Write `eval/runner.py`**
-
-```python
-"""Run the agent against an eval dataset in dry-run mode (no PR opened)."""
-from __future__ import annotations
-import argparse
-import asyncio
-import json
-import os
-import statistics
-from pathlib import Path
-from datetime import datetime, UTC
-from ossagent.config import load_models_config
-from ossagent.db import Database
-from ossagent.github_client import GitHubClient
-from ossagent.models import get_llm
-from ossagent.agent.context import load_repo_context
-from ossagent.agent.context_extractor import make_extractor
-from ossagent.agent.graph import build_graph
-from ossagent.agent.tools import shallow_clone_or_pull, create_branch
-from ossagent.triager import Triager
-
-
-async def main() -> None:
-    p = argparse.ArgumentParser()
-    p.add_argument("--dataset", default="eval/dataset.jsonl")
-    p.add_argument("--out", default="eval/results.jsonl")
-    p.add_argument("--limit", type=int, default=None)
-    p.add_argument("--config-dir", default="config")
-    p.add_argument("--data-dir", default="/tmp/ossagent-eval")
-    args = p.parse_args()
-
-    data_dir = Path(args.data_dir)
-    data_dir.mkdir(parents=True, exist_ok=True)
-    db = Database(data_dir / "eval.db")
-    db.init_schema()
-
-    models = load_models_config(Path(args.config_dir) / "models.yaml")
-    gh = GitHubClient()
-    extractor = make_extractor(get_llm("planner", config=models))
-    triager = Triager(llm=get_llm("triager", config=models))
-    llms = {
-        role: get_llm(role, config=models)
-        for role in ("planner", "locator", "implementer", "tester", "critic", "pr_writer")
-    }
-
-    class _DummyBot:
-        async def send_draft_for_approval(self, **_): return 0
-
-    graph = build_graph(
-        llms=llms, telegram_bot=_DummyBot(), our_login="koala25",
-        checkpoint_db=data_dir / "checkpoints.db",
-    )
-
-    out = Path(args.out); out.parent.mkdir(parents=True, exist_ok=True)
-    results: list[dict] = []
-    with Path(args.dataset).open() as src, out.open("w") as dst:
-        for i, line in enumerate(src):
-            if args.limit and i >= args.limit:
-                break
-            record = json.loads(line)
-            true_class = record.get("true_classification")
-            if not true_class:
-                continue
-            owner, name, number = _parse(record["issue_url"])
-            issue = await gh.fetch_issue(owner, name, number)
-            triage = await triager.classify(issue)
-            class_match = (triage.classification.value == true_class)
-
-            repo_path = data_dir / "repos" / owner / name
-            shallow_clone_or_pull(f"https://github.com/{owner}/{name}.git", repo_path)
-            create_branch(repo_path, f"eval/{number}")
-            ctx = load_repo_context(repo_path, owner, name, extractor=extractor)
-
-            state = {
-                "issue_url": record["issue_url"],
-                "repo_url": f"https://github.com/{owner}/{name}",
-                "classification": true_class,   # use the GOLD label so agent sees the right lane
-                "attempt_id": f"eval-{i}",
-                "issue": issue,
-                "repo_path": repo_path,
-                "repo_context": ctx,
-                "retry_count": 0, "style_retry_count": 0, "cost_so_far": 0.0,
-            }
-            start = datetime.now(UTC)
-            try:
-                final = await graph.ainvoke(
-                    state,
-                    config={"configurable": {"thread_id": f"eval-{i}"}, "recursion_limit": 50},
-                )
-            except Exception as e:
-                final = {"error": str(e)}
-            elapsed = (datetime.now(UTC) - start).total_seconds()
-
-            solved = bool(final.get("test_run") and final["test_run"].passed)
-            record_out = {
-                "issue_url": record["issue_url"],
-                "true_class": true_class,
-                "triage_class": triage.classification.value,
-                "triage_class_match": class_match,
-                "triage_confidence": triage.confidence,
-                "solved": solved,
-                "critic_verdict": final.get("critic_verdict"),
-                "elapsed_s": elapsed,
-                "cost_usd": _attempt_cost(db, f"eval-{i}"),
-            }
-            dst.write(json.dumps(record_out) + "\n")
-            results.append(record_out)
-            print(f"[{i}] solved={solved} cls_match={class_match} cost=${record_out['cost_usd']:.3f}")
-
-    _print_summary(results)
-
-
-def _parse(url: str) -> tuple[str, str, int]:
-    parts = url.rstrip("/").split("/")
-    return parts[-4], parts[-3], int(parts[-1])
-
-
-def _attempt_cost(db, attempt_id: str) -> float:
-    import sqlite3
-    with sqlite3.connect(db.path) as c:
-        row = c.execute(
-            "SELECT COALESCE(SUM(cost_usd), 0) FROM cost_ledger WHERE attempt_id = ?",
-            (attempt_id,),
-        ).fetchone()
-    return float(row[0])
-
-
-def _print_summary(results: list[dict]) -> None:
-    if not results:
-        print("no results")
-        return
-    n = len(results)
-    solved = sum(1 for r in results if r["solved"])
-    cls_match = sum(1 for r in results if r["triage_class_match"])
-    costs = [r["cost_usd"] for r in results]
-    elapsed = [r["elapsed_s"] for r in results]
-    print(f"\n=== Summary ===")
-    print(f"N={n}")
-    print(f"solve_rate={solved/n:.2%}")
-    print(f"classification_accuracy={cls_match/n:.2%}")
-    print(f"cost: median=${statistics.median(costs):.3f}  p95=${_p95(costs):.3f}  total=${sum(costs):.2f}")
-    print(f"latency: median={statistics.median(elapsed):.1f}s  p95={_p95(elapsed):.1f}s")
-
-
-def _p95(xs):
-    if not xs: return 0
-    s = sorted(xs)
-    return s[int(0.95 * (len(s) - 1))]
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
-```
-
-- [ ] **Step 2: Verify import-only**
-
-```bash
-.venv/bin/python -c "import eval.runner; print('ok')" 2>&1 | head -1
-```
-
-(May emit Python's warning about `eval` shadowing — ignore, or rename the dir to `evals/` if you prefer.)
-
-- [ ] **Step 3: Run a small eval (3-5 examples) to validate the pipeline**
-
-```bash
-.venv/bin/python eval/runner.py --dataset eval/dataset.jsonl --limit 5
-```
-
-Expected: prints per-example results and a summary. Total cost under $5.
-
-- [ ] **Step 4: Commit**
-
-```bash
-git add eval/runner.py
-git commit -m "feat(eval): offline eval runner with solve-rate and cost metrics"
-```
-
----
-
-## Task 20: Single-shot baseline
-
-**Files:**
-- Create: `eval/baseline.py`
-
-- [ ] **Step 1: Write `eval/baseline.py`**
-
-```python
-"""Single-shot baseline: one LLM call with the whole issue, no agent loop.
-
-Compare against `runner.py` results on the same dataset. The README's headline
-metric is 'specialized agent improves solve rate by N% over single-shot'.
-"""
-from __future__ import annotations
-import argparse
-import asyncio
-import json
-import os
-import subprocess
-import tempfile
-from pathlib import Path
-from langchain_core.messages import HumanMessage, SystemMessage
-from ossagent.config import load_models_config
-from ossagent.models import get_llm
-
-
-SYSTEM = """You are a one-shot fix generator. Given an issue and the relevant
-file contents, output a unified diff that fixes the issue. Output ONLY the diff.
-"""
-
-
-async def main() -> None:
-    p = argparse.ArgumentParser()
-    p.add_argument("--dataset", default="eval/dataset.jsonl")
-    p.add_argument("--out", default="eval/baseline_results.jsonl")
-    p.add_argument("--limit", type=int, default=None)
-    args = p.parse_args()
-
-    models = load_models_config(Path("config/models.yaml"))
-    llm = get_llm("implementer", config=models)
-
-    out = Path(args.out); out.parent.mkdir(parents=True, exist_ok=True)
-    n, solved = 0, 0
-    with Path(args.dataset).open() as src, out.open("w") as dst:
-        for i, line in enumerate(src):
-            if args.limit and i >= args.limit:
-                break
-            r = json.loads(line)
-            # Fetch the upstream diff to extract the file path
-            file_path = _file_from_pr_diff(r["pr_diff_url"])
-            owner, name, num = _parse(r["issue_url"])
-            file_text = _read_file_at_head(owner, name, file_path)
-
-            msg = await llm.ainvoke([
-                SystemMessage(content=SYSTEM),
-                HumanMessage(content=(
-                    f"# Issue\n{r['issue_title']}\n\n{r['issue_body'][:3000]}\n\n"
-                    f"# File: {file_path}\n```\n{file_text[:6000]}\n```\n"
-                )),
-            ])
-            diff = msg.content.strip()
-            # Apply + run tests in a tmp clone
-            with tempfile.TemporaryDirectory() as td:
-                subprocess.run(
-                    ["git", "clone", "--depth", "1",
-                     f"https://github.com/{owner}/{name}.git", td],
-                    check=True, capture_output=True,
-                )
-                try:
-                    subprocess.run(["git", "apply", "-"], cwd=td, input=diff,
-                                   text=True, check=True, capture_output=True)
-                    proc = subprocess.run(
-                        ["pytest", "-x", "--timeout=60", "-q", "tests/"],
-                        cwd=td, capture_output=True, text=True, timeout=600,
-                    )
-                    s = (proc.returncode == 0)
-                except subprocess.CalledProcessError:
-                    s = False
-            dst.write(json.dumps({"issue_url": r["issue_url"], "solved": s}) + "\n")
-            n += 1
-            solved += int(s)
-            print(f"[{i}] solved={s}")
-
-    print(f"\n=== Baseline summary ===\nN={n} solve_rate={solved/max(n,1):.2%}")
-
-
-def _file_from_pr_diff(diff_url: str) -> str:
-    import httpx
-    r = httpx.get(diff_url, follow_redirects=True, timeout=20)
-    for line in r.text.splitlines():
-        if line.startswith("+++ b/"):
-            return line[len("+++ b/"):]
-    return ""
-
-
-def _read_file_at_head(owner: str, name: str, path: str) -> str:
-    import httpx
-    url = f"https://raw.githubusercontent.com/{owner}/{name}/HEAD/{path}"
-    r = httpx.get(url, timeout=20)
-    return r.text if r.status_code == 200 else ""
-
-
-def _parse(url: str) -> tuple[str, str, int]:
-    parts = url.rstrip("/").split("/")
-    return parts[-4], parts[-3], int(parts[-1])
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
-```
-
-- [ ] **Step 2: Run on the same subset as runner**
-
-```bash
-.venv/bin/python eval/baseline.py --dataset eval/dataset.jsonl --limit 5
-```
-
-- [ ] **Step 3: Commit**
-
-```bash
-git add eval/baseline.py
-git commit -m "feat(eval): single-shot baseline for solve-rate comparison"
-```
-
----
-
-## Task 21: Eval — generate the headline numbers
-
-- [ ] **Step 1: Run the full agent over the labeled set**
-
-```bash
-.venv/bin/python eval/runner.py --dataset eval/dataset.jsonl
-```
-
-This will take several hours and cost ~$30-50. Set up overnight.
-
-- [ ] **Step 2: Run the baseline**
-
-```bash
-.venv/bin/python eval/baseline.py --dataset eval/dataset.jsonl
-```
-
-Another few hours, similar cost.
-
-- [ ] **Step 3: Write a small comparison script**
-
-Create `eval/compare.py`:
-
-```python
-"""Print agent vs baseline comparison table for the README."""
-from __future__ import annotations
-import json
-import statistics
-from pathlib import Path
-from collections import defaultdict
-
-
-def main() -> None:
-    agent = [json.loads(l) for l in Path("eval/results.jsonl").read_text().splitlines()]
-    baseline = [json.loads(l) for l in Path("eval/baseline_results.jsonl").read_text().splitlines()]
-    base_lookup = {r["issue_url"]: r for r in baseline}
-
-    overall_a = sum(r["solved"] for r in agent) / max(len(agent), 1)
-    overall_b = sum(r["solved"] for r in baseline) / max(len(baseline), 1)
-    print(f"agent overall solve_rate:    {overall_a:.2%}")
-    print(f"baseline overall solve_rate: {overall_b:.2%}")
-    print(f"absolute lift:               {(overall_a - overall_b) * 100:+.1f}pp")
-
-    per_class = defaultdict(lambda: [0, 0])
-    for r in agent:
-        per_class[r["true_class"]][0] += 1
-        if r["solved"]:
-            per_class[r["true_class"]][1] += 1
-    print("\nPer-class agent solve rate:")
-    for cls, (n, s) in sorted(per_class.items()):
-        print(f"  {cls:12s} {s}/{n} ({s/max(n,1):.0%})")
-
-
-if __name__ == "__main__":
-    main()
-```
-
-```bash
-.venv/bin/python eval/compare.py
-```
-
-- [ ] **Step 4: Commit results**
-
-```bash
-git add eval/results.jsonl eval/baseline_results.jsonl eval/compare.py
-git commit -m "data: full eval + baseline results for README"
-```
-
----
-
-## Task 22: Pre-commit gate + final lint pass
-
-**Files:**
-- Create: `.pre-commit-config.yaml`
-
-- [ ] **Step 1: Write `.pre-commit-config.yaml`**
-
-```yaml
-repos:
-  - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.7.4
-    hooks:
-      - id: ruff
-        args: [--fix]
-      - id: ruff-format
-  - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.13.0
-    hooks:
-      - id: mypy
-        additional_dependencies:
-          - pydantic>=2.9
-          - types-PyYAML
-        args: [--config-file=pyproject.toml]
-```
-
-- [ ] **Step 2: Install hooks and run across codebase**
-
-```bash
-.venv/bin/pre-commit install
-.venv/bin/pre-commit run --all-files
-```
-
-Fix any reported issues and re-run until clean.
-
-- [ ] **Step 3: Commit**
-
-```bash
-git add .pre-commit-config.yaml
-git commit -m "chore: pre-commit gating (ruff + mypy)"
-```
-
----
-
-## Task 23: Architecture diagram
-
-**Files:**
-- Create: `docs/architecture.md`, `docs/architecture.png`
-
-- [ ] **Step 1: Write `docs/architecture.md` (Mermaid source)**
-
-```markdown
-# Architecture
-
-```mermaid
-flowchart TD
-    GH[GitHub Issues] -->|cron 30m| Poll[poll_repos]
-    Poll --> Triager{Triager<br/>Kimi}
-    Triager -->|fit + conf>=0.7| Spawn[process_issue_fn]
-    Triager -->|reject| TG1[Telegram notify]
-    Spawn --> Plan[plan]
-    Plan --> Locate[locate]
-    Locate -->|BUG_FIX| Reproduce[reproduce]
-    Locate -->|other| Implement[implement]
-    Reproduce --> Implement
-    Implement -->|TEST_GAP| AddTest[add_test]
-    Implement -->|other| Style[enforce_style]
-    AddTest --> Style
-    Style -->|violations| Implement
-    Style --> Tests[run_tests]
-    Tests --> Critic[critic]
-    Critic -->|RETRY| Plan
-    Critic -->|PASS| Pr[prepare_pr]
-    Critic -->|ABORT| Skip[log_skip]
-    Pr --> SendTG[send_tg<br/>inline keyboard]
-    SendTG -.->|user taps| Webhook[telegram_webhook]
-    Webhook --> Push[push_and_open_pr_fn]
-    Push --> Draft[GitHub draft PR]
-    Draft -.->|daily cron| Sync[daily_sync<br/>merge/reject tracking]
-```
-```
-
-- [ ] **Step 2: Render to PNG**
-
-Use [mermaid.live](https://mermaid.live) → paste the diagram → Export PNG. Save as `docs/architecture.png`.
-
-- [ ] **Step 3: Commit**
-
-```bash
-git add docs/architecture.md docs/architecture.png
-git commit -m "docs: architecture diagram (Mermaid + PNG)"
-```
-
----
-
-## Task 24: README with real numbers
+## Task 18: Phase 2 README
 
 **Files:**
 - Modify: `README.md`
 
-- [ ] **Step 1: Rewrite `README.md`**
-
-Replace the contents with (filling in the actual numbers from `eval/compare.py` output):
+- [ ] **Step 1: Replace `README.md`**
 
 ```markdown
-# ossagent — Multi-Agent Open-Source Contributor
+# mend-pilot
 
-A LangGraph-orchestrated agent that drafts open-source contributions for review. Watches `langchain-ai/langchain` and `tiangolo/fastapi`, classifies new issues, attempts a fix, runs the repo's own linters and tests, and asks for single-click approval via Telegram before opening a GitHub draft PR.
+A multi-agent open-source contribution bot. **Phase 2: working agent — real draft PRs.**
 
-## Headline numbers
+## Status
 
-(Fill in from `eval/compare.py` output after Task 21)
+Phase 2 deployed. The bot watches selected open-source repos, classifies new issues with a cheap LLM triager, runs a LangGraph agent to draft a fix for fit issues, asks for single-click approval via Telegram, and on approval pushes a branch and opens a GitHub **draft PR**.
 
-| Metric | Value |
-|---|---|
-| Eval set size | 100 labeled PRs (LangChain + FastAPI) |
-| Agent solve rate | **NN%** |
-| Single-shot baseline solve rate | NN% |
-| **Lift over baseline** | **+N.Npp** |
-| Classification accuracy (Triager) | NN% |
-| Median cost per attempt | $N.NN |
-| Median latency per attempt | NN s |
-| Drafts prepared (live) | NN |
-| Approved + opened as PRs | NN |
-| Merged by maintainers | NN |
+The headline numbers (solve rate, $/PR, agent-vs-baseline lift) are produced in **Phase 3** ([plan](docs/superpowers/plans/2026-05-17-phase-3-eval-and-polish.md)).
 
 ## Architecture
 
-![architecture](docs/architecture.png)
+```
+GitHub Issues
+   │  (cron, every 30m)
+   ▼
+poll_repos  ──►  Triager (Moonshot LLM)
+                    │  (fit + conf >= 0.7, DEPRECATION/BUG_FIX/etc.)
+                    ▼
+              process_issue_fn (Modal worker)
+                    │
+                    ▼
+              LangGraph: plan → locate → reproduce? → implement → add_test?
+                          → enforce_style → run_tests → critic → prepare_pr → send_tg
+                    │
+                    ▼
+              Telegram message with inline buttons
+                    │  (you tap Approve)
+                    ▼
+              telegram_webhook → push_and_open_pr_fn
+                    │
+                    ▼
+              GitHub draft PR on the upstream repo
+```
 
-The agent is a LangGraph state machine with conditional routing per issue classification. See [docs/architecture.md](docs/architecture.md) for the source.
+Components — one responsibility each:
 
-Key design choices and tradeoffs are documented in [the design spec](docs/superpowers/specs/2026-05-16-mend-pilot-design.md).
+| File | Responsibility |
+|---|---|
+| `src/ossagent/agent/state.py` | `AgentState` TypedDict + supporting dataclasses |
+| `src/ossagent/agent/context.py` | `RepoContext` loader with on-disk cache |
+| `src/ossagent/agent/context_extractor.py` | LLM extraction of style notes, test patterns, PR norms |
+| `src/ossagent/agent/tools.py` | git, diff, ripgrep, file-window helpers |
+| `src/ossagent/agent/ast_locator.py` | tree-sitter symbol lookup for Python repos |
+| `src/ossagent/agent/nodes.py` | All 11 LangGraph node functions |
+| `src/ossagent/agent/graph.py` | `build_graph()` with conditional routing + checkpointing |
+| `src/ossagent/worker.py` | `process_issue` with 8-step pre-process guards |
+| `src/ossagent/webhook.py` | Telegram callback handler |
+| `src/ossagent/pr_creator.py` | Commit + push + `gh pr create --draft` |
+| `src/ossagent/crons.py` | Daily PR-status sync + stale-draft cleanup |
+| `src/ossagent/app.py` | Modal app — 5 functions (scheduler, worker, webhook, PR opener, daily cron) |
 
-## Operational characteristics
+## Operational cost
 
-- **Deployment:** Modal (scale-to-zero serverless). Single app, six functions: scheduler cron, worker, webhook, PR opener, daily sync, local entrypoint.
-- **Model:** Default Kimi (Moonshot, OpenAI-compatible API). Pluggable to Claude / GPT via a one-line YAML change. A/B benchmarks vs Claude Opus 4.7 [coming Phase 3].
-- **Cost:** ~$25-35/month all-in. Hard caps: $3/attempt, $5/day, $50/month. Auto-pause at 95% of monthly cap.
-- **Safety:** Mandatory human review via Telegram inline keyboard before any PR opens. AI-disclosure footer on every PR. Strict per-repo rate limit (≤5 attempts/day). All test runs in a sandboxed Modal container.
+Based on Phase 1 actuals × Phase 2 multipliers. On `moonshot-v1-8k`:
 
-## Why multi-agent
+- Triager: ~$0.05/mo (~9k cheap calls)
+- Agent runs: ~$0.30-1.00/mo (~150 attempts × ~$0.003 each, 7-node pipeline)
+- Modal compute: well under the $30 free credit
+- **Realistic total: ~$0.50-1/month**
 
-Specialized agents outperform single-shot LLMs on this task by NN percentage points (see Headline numbers). Different bug classes need different reasoning modes:
-
-- Triager: cheap, fast, strict classifier (Kimi Haiku-tier)
-- Reproducer: writes a failing test (BUG_FIX lane only)
-- Implementer: writes the diff (heaviest model)
-- Critic: adversarial reviewer with hard-rule overrides on tests/style failures
-- Specialized routing per classification (TYPO / DEPRECATION / TEST_GAP / BUG_FIX)
-
-Cost-aware: cheaper models for high-volume cheap stages (Triager), expensive models only for the Implementer when the change is non-trivial.
+Hard caps in place: $3/attempt, $5/day, $50/month. Auto-pause at 95% of monthly cap.
 
 ## Running locally
 
 ```bash
 uv venv --python 3.12
 uv pip install -e ".[dev]"
-modal secret create ossagent-secrets --from-dotenv ~/.config/ossagent.env
-modal deploy src/ossagent/app.py
+.venv/bin/pre-commit install
 ```
 
-## Repository layout
+To run end-to-end you need to deploy — local mocks for the Modal volume aren't part of v1.
 
+## Deploying
+
+```bash
+modal secret create ossagent-secrets --from-dotenv ~/.config/ossagent.env --force
+.venv/bin/modal deploy src/ossagent/app.py
 ```
-src/ossagent/agent/   — LangGraph nodes, state, graph, AST locator
-src/ossagent/         — Modal app, worker, webhook, PR opener, crons
-config/               — YAML model + repo configs
-eval/                 — eval dataset, runner, baseline, comparison
-docs/                 — architecture, specs, plans
+
+Then register the Telegram webhook (see Task 17 of this plan).
+
+## Inspecting state
+
+```bash
+.venv/bin/modal volume get ossagent-data /attempts.db /tmp/attempts.db --force
+sqlite3 /tmp/attempts.db "SELECT attempt_id, status, repo_owner, classification, started_at FROM attempts ORDER BY started_at DESC LIMIT 20;"
+sqlite3 /tmp/attempts.db "SELECT role, sum(input_tokens), sum(output_tokens), sum(cost_usd) FROM cost_ledger GROUP BY role;"
 ```
 
-## What's next (Phase 3+)
+## What's next
 
-- Phase 2.5: full pytest test suite + CI on GitHub Actions
-- Phase 3: more watched repos, more classifications, multi-file refactor lane
-- A/B benchmark vs Claude Opus 4.7 on the eval set, published in this README
+- [Phase 3](docs/superpowers/plans/2026-05-17-phase-3-eval-and-polish.md) — eval harness, headline solve-rate vs single-shot baseline, architecture diagram, 60-second demo video, recruiter-grade README polish.
+- Phase 2.5 — deferred unit-test pass (see below).
 ```
 
 - [ ] **Step 2: Commit**
 
 ```bash
 git add README.md
-git commit -m "docs: comprehensive README with eval numbers"
-```
-
----
-
-## Task 25: 60-second demo video
-
-This is a one-time manual task — produces the artifact most likely to land you the interview.
-
-- [ ] **Step 1: Install Loom**
-
-[loom.com/desktop](https://www.loom.com/desktop) (free tier is fine).
-
-- [ ] **Step 2: Storyboard (8 shots, ~7-8 seconds each)**
-
-1. Splash: title card "ossagent — multi-agent OSS contributor"
-2. Show a real GitHub deprecation issue you'll demo on
-3. Modal dashboard: scheduler firing, worker starting
-4. Briefly scroll the LangGraph trace (LangSmith or logs)
-5. Telegram message arriving on your phone with inline buttons
-6. Your finger tapping ✅
-7. The resulting GitHub draft PR
-8. README's headline-numbers table
-
-- [ ] **Step 3: Record + upload**
-
-Loom records, gives you a URL, embed at the top of README. Or save the MP4 and put in `docs/demo.mp4`.
-
-- [ ] **Step 4: Add the link to README**
-
-Add this line at the top of `README.md`:
-
-```markdown
-> **▶ [60-second demo](https://www.loom.com/share/<your-id>)**
-```
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add README.md
-git commit -m "docs: embed 60-second demo video"
+git commit -m "docs: Phase 2 README"
 ```
 
 ---
 
 ## Phase 2.5 — Deferred testing pass
 
-Tests skipped throughout Phase 2. After everything runs end-to-end and you've prepared ≥5 real drafts, spend a day:
+No unit tests in Phase 2. After Phase 2 has prepared ≥5 real drafts and you've ironed out the obvious failure modes, spend a day:
 
 1. `tests/conftest.py` with `tmp_sqlite` fixture
 2. Unit tests for graph routing functions (no LLM needed)
 3. Unit tests for `enforce_style` and `run_tests` nodes (subprocess wrappers)
-4. Unit tests for `worker.process_issue` pre-process guards with fake DB
-5. Critic hard-rule overrides (test fail → RETRY)
-6. Mock-LLM tests for plan/locate/implement/critic nodes
+4. Unit tests for `worker.process_issue` pre-process guards with a fake DB
+5. Critic hard-rule overrides (test failure → forced RETRY)
+6. Mock-LLM tests for plan / locate / implement / critic nodes
 7. End-to-end test with a tiny git repo and all-mocked LLMs
 8. GitHub Action running `pytest` + `pre-commit run --all-files` on every push
 
@@ -2873,31 +2261,30 @@ This becomes its own short plan.
 Coverage vs spec `2026-05-16-mend-pilot-design.md`:
 
 - ✅ §3 High-level architecture
-- ✅ §4 LangGraph — all 11 nodes wired across all 4 lanes (TYPO/DEPRECATION/TEST_GAP/BUG_FIX)
+- ✅ §4 LangGraph — all 11 nodes wired across all 4 lanes (TYPO / DEPRECATION / TEST_GAP / BUG_FIX)
 - ✅ §4.0 Worker pre-process — 8-step guards implemented in `worker.py`
 - ✅ §4.5 Retry semantics — both inner (style) and outer (agent) loops
-- ✅ §4.6 Checkpointing — SqliteSaver on Modal volume
+- ✅ §4.6 Checkpointing — `SqliteSaver` on Modal volume
 - ✅ §4.7 RepoContext — loader + LLM extractor + 7-day cache
 - ✅ §5 Two-stage triage — scheduler-level Triager filters before worker spawn
-- ✅ §6 Telegram interaction — inline keyboard + webhook + push_and_open_pr
-- ✅ §7 Model abstraction — provider-agnostic factory, default Kimi
-- ✅ §8 Modal deployment — all functions registered
-- ✅ §9 Evaluation harness — dataset scraper + runner + baseline + comparison
-- ✅ §10 Cost analysis — $/attempt tracked in ledger; eval reports median + p95
-- ✅ §11 Risks — mitigated by draft mode + disclosure + caps + rate limits
-- ✅ §12 Roadmap — Phase 2 covers what was previously Phases 2-5
-- ⚠️ AST locator — implemented for Python; non-Python repos fall back to ripgrep
+- ✅ §6 Telegram interaction — inline keyboard + webhook + push_and_open_pr (no AI disclosure footer)
+- ✅ §7 Model abstraction — provider-agnostic factory, default Moonshot
+- ✅ §8 Modal deployment — all 5 functions registered
+- ❌ §9 Evaluation harness — deferred to Phase 3
+- ❌ §10 Cost analysis (full eval-driven numbers) — deferred to Phase 3
+- ✅ §11 Risks — mitigated by human review + caps + rate limits
+- ⚠️ AST locator — Python only; non-Python repos fall back to ripgrep
 - ⚠️ Per-repo Modal images — single Python image for now; revisit if Polars/Rust repos added
 
-Phase 2 acceptance: meets the spec's Phase 5 polish criteria. README has real numbers, demo video, architecture diagram, eval set. Recruiter-ready.
+Phase 2 acceptance: real GitHub draft PRs opened end-to-end on at least one watched repo, with the prepare_pr humanizer producing PR bodies that don't read as AI-generated.
 
 ---
 
-## What's NOT in this plan (genuinely deferred)
+## What's NOT in this plan (deferred)
 
-- **Claude A/B comparison** — requires re-running `eval/runner.py` with `implementer: claude-opus-4-7` in `models.yaml` and producing a side-by-side table. ~1 day of work + ~$60 in API costs. Save as a follow-up "blog post / README update" task.
-- **More watched repos** — easy: add to `config/watched_repos.yaml`. Recommended after first 14 days of stable operation.
-- **Per-repo Modal images** — only needed if you add repos with non-Python system deps (Polars/Rust, etc.).
-- **Comprehensive unit tests** — Phase 2.5 plan.
-
-Everything else from the spec is in this plan.
+- **Eval harness, solve-rate numbers, baseline comparison** — Phase 3 (`2026-05-17-phase-3-eval-and-polish.md`).
+- **Architecture diagram + demo video + README polish with real numbers** — Phase 3.
+- **Comprehensive unit tests** — Phase 2.5.
+- **Claude vs Kimi A/B benchmark** — stretch goal at the end of Phase 3.
+- **More watched repos** — easy add to `config/watched_repos.yaml` once Phase 2 has been stable for ≥14 days.
+- **Per-repo Modal images** — only needed if you add repos with non-Python system deps.

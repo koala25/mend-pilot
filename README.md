@@ -101,7 +101,7 @@ sqlite3 /tmp/attempts.db "SELECT role, sum(input_tokens), sum(output_tokens), su
 
 ## What's next (Phase 2+)
 
-See [`docs/superpowers/plans/2026-05-16-phase-2-full-agent-system.md`](docs/superpowers/plans/2026-05-16-phase-2-full-agent-system.md):
+See [`docs/superpowers/plans/2026-05-16-phase-2-working-agent.md`](docs/superpowers/plans/2026-05-16-phase-2-working-agent.md) (working flow, real PRs) and [`docs/superpowers/plans/2026-05-17-phase-3-eval-and-polish.md`](docs/superpowers/plans/2026-05-17-phase-3-eval-and-polish.md) (eval, numbers, demo):
 
 1. LangGraph agent that proposes a fix for each fit issue
 2. Telegram inline-keyboard approval flow → `gh pr create --draft`

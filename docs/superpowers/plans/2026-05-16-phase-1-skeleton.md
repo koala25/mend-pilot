@@ -1227,4 +1227,4 @@ Phase 1 acceptance per spec: *"scheduler fires, lists new issues for one repo, s
 
 ## Next plan
 
-After Phase 1 runs cleanly for a few days, the next plan is `2026-XX-XX-phase-2-deprecation-lane.md`: `load_repo_context`, full LangGraph for DEPRECATION classification, `enforce_style`, Critic, Telegram webhook for single-click approval, push + `gh pr create --draft`.
+After Phase 1 runs cleanly for a few days, the next plan is `2026-05-16-phase-2-working-agent.md`: full LangGraph for all 4 classifications, `load_repo_context`, `enforce_style`, Critic, Telegram webhook for single-click approval, push + `gh pr create --draft`. Phase 3 (`2026-05-17-phase-3-eval-and-polish.md`) then runs the eval and ships the README with real numbers.
