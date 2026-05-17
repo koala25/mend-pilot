@@ -1,56 +1,65 @@
-# ossagent
+# mend-pilot
 
-A multi-agent open-source contribution bot. **Phase 1: skeleton — polling and triage only.**
+A multi-agent open-source contribution bot. **Phase 2: working agent — real draft PRs.**
 
 ## Status
 
-Phase 1 deployed. Every 30 minutes the bot polls [`langchain-ai/langchain`](https://github.com/langchain-ai/langchain), classifies new issues with a cheap LLM (Moonshot's `moonshot-v1-8k`), and sends a Telegram message for any issue classified as a good candidate for automated fixing.
+Phase 2 deployed. The bot watches selected open-source repos, classifies new issues with a cheap LLM triager, runs a LangGraph agent to draft a fix for fit issues, asks for single-click approval via Telegram, and on approval pushes a branch and opens a GitHub **draft PR**.
 
-Subsequent phases will add the LangGraph agent that drafts the fixes themselves. See
-[`docs/superpowers/specs/2026-05-16-mend-pilot-design.md`](docs/superpowers/specs/2026-05-16-mend-pilot-design.md)
-for the full design, and [`docs/superpowers/plans/`](docs/superpowers/plans/) for the per-phase
-implementation plans.
+The headline numbers (solve rate, $/PR, agent-vs-baseline lift) are produced in **Phase 3** ([plan](docs/superpowers/plans/2026-05-17-phase-3-eval-and-polish.md)).
 
-## Architecture (Phase 1)
+## Architecture
 
 ```
 GitHub Issues
    │  (cron, every 30m)
    ▼
-poll_repos  ──►  Triager (Moonshot LLM)  ──►  Telegram (when fit + conf >= 0.7)
-   │                                              │
-   ▼                                              ▼
-SQLite on Modal volume                       User's phone
-(repo_state, cost_ledger, attempts)
+poll_repos  ──►  Triager (Moonshot LLM)
+                    │  (fit + conf >= 0.7, DEPRECATION/BUG_FIX/etc.)
+                    ▼
+              process_issue_fn (Modal worker)
+                    │
+                    ▼
+              LangGraph: plan → locate → reproduce? → implement → add_test?
+                          → enforce_style → run_tests → critic → prepare_pr → send_tg
+                    │
+                    ▼
+              Telegram message with inline buttons
+                    │  (you tap Approve)
+                    ▼
+              telegram_webhook → push_and_open_pr_fn
+                    │
+                    ▼
+              GitHub draft PR on the upstream repo
 ```
 
 Components — one responsibility each:
 
 | File | Responsibility |
 |---|---|
-| `src/ossagent/config.py` | Load `models.yaml` + `watched_repos.yaml` |
-| `src/ossagent/models.py` | Provider-agnostic LLM factory (Moonshot, OpenAI, Anthropic) |
-| `src/ossagent/db.py` | SQLite schema + helpers (attempts, cost ledger, repo state); UTC-safe datetime adapters |
-| `src/ossagent/telemetry.py` | `CostTracker` LangChain callback for $/token logging |
-| `src/ossagent/github_client.py` | Async REST client (`fetch_new_issues`, `fetch_issue`) |
-| `src/ossagent/telegram.py` | Outbound Telegram notifications (HTML-escaped) |
-| `src/ossagent/triager.py` | Stage-1 LLM classifier → `TriageVerdict` |
-| `src/ossagent/scheduler.py` | Per-tick orchestration: fetch → triage → notify |
-| `src/ossagent/app.py` | Modal app entry point |
+| `src/ossagent/agent/state.py` | `AgentState` TypedDict + supporting dataclasses |
+| `src/ossagent/agent/context.py` | `RepoContext` loader with on-disk cache |
+| `src/ossagent/agent/context_extractor.py` | LLM extraction of style notes, test patterns, PR norms |
+| `src/ossagent/agent/tools.py` | git, diff, ripgrep, file-window helpers |
+| `src/ossagent/agent/ast_locator.py` | tree-sitter symbol lookup for Python repos |
+| `src/ossagent/agent/nodes.py` | All 11 LangGraph node functions |
+| `src/ossagent/agent/graph.py` | `build_graph()` with conditional routing + checkpointing |
+| `src/ossagent/worker.py` | `process_issue` with 8-step pre-process guards |
+| `src/ossagent/webhook.py` | Telegram callback handler |
+| `src/ossagent/pr_creator.py` | Commit + push + `gh pr create --draft` |
+| `src/ossagent/crons.py` | Daily PR-status sync + stale-draft cleanup |
+| `src/ossagent/app.py` | Modal app — 5 functions (scheduler, worker, webhook, PR opener, daily cron) |
 
-## Stack
+## Operational cost
 
-- **Python 3.12**, [`uv`](https://docs.astral.sh/uv/) for env management
-- **[Modal](https://modal.com)** for serverless cron + container deployment
-- **[LangChain](https://python.langchain.com/)** core abstractions, model-agnostic via YAML config
-- **[Moonshot](https://platform.moonshot.ai/)** for cheap fast triage; swappable to Anthropic / OpenAI by editing one YAML
-- **SQLite** on a Modal volume for state
-- **Telegram Bot API** for notifications
-- **ruff + mypy strict** gating commits via pre-commit
+Based on Phase 1 actuals × Phase 2 multipliers. On `moonshot-v1-8k`:
 
-## Cost (Phase 1)
+- Triager: ~$0.05/mo (~9k cheap calls)
+- Agent runs: ~$0.30-1.00/mo (~150 attempts × ~$0.003 each, 7-node pipeline)
+- Modal compute: well under the $30 free credit
+- **Realistic total: ~$0.50-1/month**
 
-Triager runs `moonshot-v1-8k`: $0.12/1M tokens both directions. At ~500 tokens per call and ~30 new issues/day in `langchain-ai/langchain`, the steady-state cost is **~$0.001/day**. The hard cap in the scheduler design is $50/month with a $3 per-attempt kill switch (active in Phase 2 once the heavy worker is wired in).
+Hard caps in place: $3/attempt, $5/day, $50/month. Auto-pause at 95% of monthly cap.
 
 ## Running locally
 
@@ -60,63 +69,26 @@ uv pip install -e ".[dev]"
 .venv/bin/pre-commit install
 ```
 
-To run a one-shot poll outside Modal you'd need to mock the Modal volume — easier to just deploy.
+To run end-to-end you need to deploy — local mocks for the Modal volume aren't part of v1.
 
 ## Deploying
 
 ```bash
-# secrets — once
-modal secret create ossagent-secrets --from-dotenv ~/.config/ossagent.env
-
-# deploy or re-deploy
+modal secret create ossagent-secrets --from-dotenv ~/.config/ossagent.env --force
 .venv/bin/modal deploy src/ossagent/app.py
-
-# manual trigger (otherwise the cron fires every 30min)
-.venv/bin/modal run src/ossagent/app.py::poll_repos
 ```
 
-The expected `~/.config/ossagent.env`:
-
-```
-MOONSHOT_API_KEY=<from platform.moonshot.ai>
-GITHUB_TOKEN=<fine-grained PAT with public_repo + issues:read>
-TELEGRAM_BOT_TOKEN=<from @BotFather>
-TELEGRAM_USER_ID=<your numeric id from @userinfobot>
-```
-
-**One-time Telegram setup:** the bot can only DM you after you've messaged it first. Open Telegram, find your bot, tap **Start**.
+Then register the Telegram webhook (see Task 17 of `docs/superpowers/plans/2026-05-16-phase-2-working-agent.md`).
 
 ## Inspecting state
 
 ```bash
-# Pull a copy of the SQLite database from the Modal volume
 .venv/bin/modal volume get ossagent-data /attempts.db /tmp/attempts.db --force
-
-# Watermark per repo
-sqlite3 /tmp/attempts.db "SELECT * FROM repo_state;"
-
-# Cost ledger (populated in Phase 2 when CostTracker is attached)
+sqlite3 /tmp/attempts.db "SELECT attempt_id, status, repo_owner, classification, started_at FROM attempts ORDER BY started_at DESC LIMIT 20;"
 sqlite3 /tmp/attempts.db "SELECT role, sum(input_tokens), sum(output_tokens), sum(cost_usd) FROM cost_ledger GROUP BY role;"
 ```
 
-## What's next (Phase 2+)
+## What's next
 
-See [`docs/superpowers/plans/2026-05-16-phase-2-working-agent.md`](docs/superpowers/plans/2026-05-16-phase-2-working-agent.md) (working flow, real PRs) and [`docs/superpowers/plans/2026-05-17-phase-3-eval-and-polish.md`](docs/superpowers/plans/2026-05-17-phase-3-eval-and-polish.md) (eval, numbers, demo):
-
-1. LangGraph agent that proposes a fix for each fit issue
-2. Telegram inline-keyboard approval flow → `gh pr create --draft`
-3. Eval harness with single-shot baseline → headline solve-rate numbers
-4. README updated with real merge-rate metrics from the eval set
-
-## Repository layout
-
-```
-mend-pilot/
-├── config/                    Provider + watched-repo configs (YAML)
-├── src/ossagent/              Module-per-responsibility Python package
-├── docs/superpowers/specs/    Design spec
-├── docs/superpowers/plans/    Per-phase implementation plans (Phase 1 + Phase 2)
-├── pyproject.toml             Deps, ruff/mypy config
-├── .pre-commit-config.yaml    ruff + mypy hooks
-└── uv.lock                    Pinned transitive dependency versions
-```
+- [Phase 3](docs/superpowers/plans/2026-05-17-phase-3-eval-and-polish.md) — eval harness, headline solve-rate vs single-shot baseline, architecture diagram, 60-second demo video, recruiter-grade README polish.
+- Phase 2.5 — deferred unit-test pass (see the Phase 2 plan).
