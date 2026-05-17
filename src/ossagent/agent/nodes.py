@@ -16,11 +16,13 @@ from ossagent.agent.context import RepoContext
 from ossagent.agent.state import (
     AgentState,
     PlanStep,
+    PRMetadata,
     StyleViolation,
     TargetFile,
     TestRunResult,
 )
 from ossagent.agent.tools import apply_unified_diff, read_file_window, ripgrep
+from ossagent.telegram import TelegramBot
 
 NodeFn = Callable[[AgentState], Awaitable[dict[str, Any]]]
 
@@ -409,3 +411,235 @@ def _find_related_tests(repo_path: Any, module_dotted: str) -> list[str]:
     if not base:
         return []
     return [str(p.relative_to(repo_path)) for p in repo_path.glob(f"tests/**/test_{base}.py")]
+
+
+# ── critic node ─────────────────────────────────────────────────────────
+
+CRITIC_SYSTEM = """You are the Critic. Review the proposed change adversarially.
+
+Decide ONE of: PASS / RETRY / ABORT.
+
+Reply STRICT JSON:
+{"verdict": "PASS|RETRY|ABORT",
+ "confidence": 0.0-1.0,
+ "reasoning": "<2-3 sentences>"}
+"""
+
+
+def make_critic_node(llm: BaseChatModel) -> NodeFn:
+    async def critic_node(state: AgentState) -> dict[str, Any]:
+        ctx: RepoContext = state["repo_context"]
+        tr: TestRunResult = state["test_run"]
+        violations = state.get("style_violations", [])
+        v_summary = (
+            "(none)"
+            if not violations
+            else "\n".join(f"- [{v.tool}] {v.file}: {v.message}" for v in violations[:10])
+        )
+        user = (
+            f"# Issue\n{state['issue'].title}\n\n{state['issue'].body[:2000]}\n\n"
+            f"# Diff\n```\n{state.get('patch', '')[:8000]}\n```\n\n"
+            f"# Tests\npassed={tr.passed} failed={tr.failed_tests}\n"
+            f"stdout_tail:\n{tr.stdout_tail[-1000:]}\n\n"
+            f"# Style violations\n{v_summary}\n\n"
+            f"# Conventions\n{(ctx.contributing_md or '')[:2000]}\n"
+        )
+        msg = await llm.ainvoke(
+            [
+                SystemMessage(content=CRITIC_SYSTEM),
+                HumanMessage(content=user),
+            ]
+        )
+        try:
+            data = json.loads(_as_text(msg.content))
+            verdict = str(data["verdict"])
+            confidence = float(data["confidence"])
+            reasoning = str(data["reasoning"])
+        except (json.JSONDecodeError, KeyError, ValueError):
+            verdict, confidence, reasoning = "ABORT", 0.0, "critic_parse_failed"
+        # Hard overrides
+        if not tr.passed:
+            verdict = "RETRY"
+        if violations and verdict == "PASS":
+            verdict = "RETRY"
+        if confidence < 0.6 and verdict == "PASS":
+            verdict = "RETRY"
+        return {
+            "critic_verdict": verdict,
+            "critic_reasoning": reasoning,
+            "confidence": confidence,
+        }
+
+    return critic_node
+
+
+# ── prepare_pr node ─────────────────────────────────────────────────────
+#
+# Two LLM passes. First writes the PR; second rewrites the body to strip
+# AI-tell stylistics. NEVER mention this project, "agent", "automation", or
+# similar in the output — author the PR as the human reviewer.
+
+
+PR_WRITER_SYSTEM = """Write the title and body for a GitHub pull request.
+
+You will be given: the issue this PR addresses, the diff, test results, and
+(if present) the repo's PR template.
+
+VOICE — read carefully. The PR should read as if a senior developer wrote it
+after thirty minutes of investigation. Be specific and technical. Skip filler.
+
+NEVER include any of these words anywhere in title or body:
+  automated, agent, bot, AI, LLM, drafted, generated, Claude, Kimi, Moonshot,
+  ossagent, mend-pilot, assistant. Do not refer to "the tool" or "this script"
+  as the author of the change. The reviewer is the author.
+
+NEVER use these stylistic crutches:
+  Em dashes. Use commas, periods, or parentheses.
+  Words: leverage, robust, comprehensive, delve, underscore, showcase, ensure,
+    foster, seamless, vital, crucial, pivotal, harness, streamline.
+  -ing tails adding fake depth ("highlighting that", "ensuring X").
+  "Not only X but Y" or "It's not just about X, it's Y".
+  Triple lists where two would do.
+  Emojis.
+  Bolded inline headers like **Summary:** or **Test plan:** in body prose.
+  Sycophantic closers ("I hope this helps", "Happy to iterate").
+  Curly quotes.
+  Title Case Section Headings (use sentence case).
+
+CONTENT the body MUST include:
+  - A link to the issue. Use `Closes #N` if same repo, full URL otherwise.
+  - One sentence describing what the diff does.
+  - Two to four sentences on WHY this fix and not an alternative: the root
+    cause, what made it surface, what else was considered and rejected.
+  - A short concrete verification section: which existing or new tests cover
+    this, and the exact pytest invocation that was run.
+  - If the repo's PR template is provided, fill ITS sections; do not invent
+    headings that aren't in the template.
+
+TITLE: conventional-commits style, lowercase subject, no trailing period.
+Examples:
+  fix(runnables): replace deprecated Runnable.run() with .invoke()
+  docs: correct typo in tool-calling guide
+
+BODY length: 80-250 words. Less is fine for trivial changes.
+
+VOICE cues:
+  Short, declarative sentences.
+  First person is fine: "I noticed", "I tried X first", "I think".
+  Specifics over abstractions. Function names, file paths, error messages,
+    test names beat generic claims about "the change".
+
+Reply STRICT JSON: {"title": "<title>", "body": "<markdown body>"}
+"""
+
+
+HUMANIZER_SYSTEM = """You are an editor stripping signs of AI authorship from
+a draft pull-request description. Apply these rewrites:
+
+  Replace any em dashes with commas, periods, or parentheses.
+  Remove or rephrase to drop these words: leverage, robust, comprehensive,
+    delve, underscore, showcase, ensure, foster, seamless, vital, crucial,
+    pivotal, harness, streamline, automated, AI, agent, bot, drafted,
+    generated, Claude, Kimi, Moonshot, ossagent, mend-pilot, assistant.
+  Remove -ing tail clauses adding fake depth ("highlighting that", "ensuring
+    X", "underscoring its importance").
+  Remove "not only/but also" and "it's not just/it's" constructions.
+  Collapse triple lists where two items already convey the point.
+  Remove emoji.
+  Convert bolded inline headers (**Foo:**) to plain prose.
+  Remove sycophantic closers.
+  Sentence-case any headings (not Title Case).
+  Replace curly quotes with straight ones.
+
+KEEP all technical content unchanged: file paths, function names, line
+numbers, test names, error messages, the issue link, the description of what
+the diff does. Do not invent or remove technical claims.
+
+Reply with just the rewritten body. No JSON, no commentary, no code fences.
+"""
+
+
+def make_prepare_pr_node(llm: BaseChatModel, *, our_login: str) -> NodeFn:
+    async def prepare_pr_node(state: AgentState) -> dict[str, Any]:
+        issue = state["issue"]
+        ctx: RepoContext = state["repo_context"]
+        tr: TestRunResult = state["test_run"]
+
+        # Pass 1 — write the PR.
+        writer_input = (
+            f"# Issue URL\n{issue.html_url}\n\n"
+            f"# Issue title\n{issue.title}\n\n"
+            f"# Issue body excerpt\n{issue.body[:1500]}\n\n"
+            f"# Diff\n```\n{state.get('patch', '')[:6000]}\n```\n\n"
+            f"# Tests\npassed={tr.passed} failed={tr.failed_tests}\n"
+            f"stdout_tail:\n{tr.stdout_tail[-800:]}\n\n"
+            f"# PR template (verbatim from repo, fill as-is if present)\n"
+            f"{ctx.pr_template or '(none)'}\n\n"
+            f"# PR norms\n"
+            f"{chr(10).join('- ' + n for n in ctx.pr_norms[:4]) or '(none)'}\n"
+        )
+        write_msg = await llm.ainvoke(
+            [
+                SystemMessage(content=PR_WRITER_SYSTEM),
+                HumanMessage(content=writer_input),
+            ]
+        )
+        try:
+            data = json.loads(_as_text(write_msg.content))
+            title = str(data["title"])
+            draft_body = str(data["body"])
+        except (json.JSONDecodeError, KeyError, ValueError):
+            # Generic minimal fallback. Never mentions our tooling.
+            title = _fallback_title(issue.title)
+            draft_body = f"Closes {issue.html_url}\n\nReviewed locally before submitting."
+
+        # Pass 2 — humanizer pass on the body. The title is already
+        # constrained to conventional-commits style by the writer prompt.
+        humanize_msg = await llm.ainvoke(
+            [
+                SystemMessage(content=HUMANIZER_SYSTEM),
+                HumanMessage(content=draft_body),
+            ]
+        )
+        body = (_as_text(humanize_msg.content) or draft_body).strip()
+
+        branch = f"fix/issue-{issue.number}-{state['attempt_id'][:8]}"
+        base_branch = "master" if ctx.repo_owner in {"langchain-ai", "tiangolo"} else "main"
+        return {
+            "pr_metadata": PRMetadata(
+                title=title,
+                body=body,
+                branch_name=branch,
+                head_owner=our_login,
+                base_branch=base_branch,
+            )
+        }
+
+    return prepare_pr_node
+
+
+def _fallback_title(issue_title: str) -> str:
+    """Conventional-commits-style title derived from the issue title."""
+    cleaned = issue_title.strip().rstrip(".").lower()[:60]
+    return f"fix: {cleaned}"
+
+
+# ── send_tg node ────────────────────────────────────────────────────────
+
+
+def make_send_tg_node(telegram_bot: TelegramBot) -> NodeFn:
+    async def send_tg_node(state: AgentState) -> dict[str, Any]:
+        pr = state["pr_metadata"]
+        await telegram_bot.send_draft_for_approval(
+            attempt_id=state["attempt_id"],
+            issue_url=state["issue"].html_url,
+            issue_title=state["issue"].title,
+            classification=state["classification"],
+            confidence=state.get("confidence", 0.0),
+            critic_reasoning=state.get("critic_reasoning", ""),
+            patch_excerpt=state.get("patch", "")[:1500],
+            pr_title=pr.title,
+        )
+        return {}
+
+    return send_tg_node

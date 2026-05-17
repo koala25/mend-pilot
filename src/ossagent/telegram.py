@@ -57,6 +57,55 @@ class TelegramBot:
                 raise RuntimeError(f"Telegram API failed: {r.status_code} {r.text}")
             return int(r.json()["result"]["message_id"])
 
+    async def send_draft_for_approval(
+        self,
+        *,
+        attempt_id: str,
+        issue_url: str,
+        issue_title: str,
+        classification: str,
+        confidence: float,
+        critic_reasoning: str,
+        patch_excerpt: str,
+        pr_title: str,
+    ) -> int:
+        text = (
+            f"🤖 Draft ready\n\n"
+            f"<b>{_escape(pr_title)}</b>\n"
+            f"Issue: {issue_url}\n\n"
+            f"Classification: <b>{classification}</b>\n"
+            f"Confidence: <b>{confidence:.2f}</b>\n\n"
+            f"Critic: {_escape(critic_reasoning)[:400]}\n\n"
+            f"<pre>{_escape(patch_excerpt)[:1500]}</pre>"
+        )
+        keyboard = {
+            "inline_keyboard": [
+                [
+                    {
+                        "text": "✅ Approve & open PR",
+                        "callback_data": f"{attempt_id}:approve",
+                    },
+                    {
+                        "text": "❌ Reject",
+                        "callback_data": f"{attempt_id}:reject",
+                    },
+                ]
+            ]
+        }
+        url = f"https://api.telegram.org/bot{self.token}/sendMessage"
+        payload = {
+            "chat_id": self.user_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+            "reply_markup": keyboard,
+        }
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.post(url, json=payload)
+            if r.status_code != 200:
+                raise RuntimeError(f"Telegram API failed: {r.status_code} {r.text}")
+            return int(r.json()["result"]["message_id"])
+
 
 def _escape(s: str) -> str:
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
