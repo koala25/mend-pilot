@@ -14,7 +14,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from ossagent.agent.ast_locator import find_python_symbol
 from ossagent.agent.context import RepoContext
 from ossagent.agent.state import AgentState, PlanStep, TargetFile
-from ossagent.agent.tools import ripgrep
+from ossagent.agent.tools import read_file_window, ripgrep
 
 NodeFn = Callable[[AgentState], Awaitable[dict[str, Any]]]
 
@@ -196,3 +196,104 @@ def make_reproduce_node(llm: BaseChatModel) -> NodeFn:
         }
 
     return reproduce_node
+
+
+# ── implement node ──────────────────────────────────────────────────────
+
+IMPLEMENT_SYSTEM = """You are the Implementer. Output a UNIFIED DIFF that fixes
+the issue. Rules:
+- Output ONLY the diff, no prose, no code fences.
+- Single file. Surgical changes.
+- Preserve indentation.
+- Must apply cleanly with `git apply`.
+"""
+
+
+def make_implement_node(llm: BaseChatModel) -> NodeFn:
+    async def implement_node(state: AgentState) -> dict[str, Any]:
+        if not state.get("target_files"):
+            return {"skip_reason": "no_target_for_implement"}
+        target = state["target_files"][0]
+        repo_path = state["repo_path"]
+        window = read_file_window(
+            repo_path,
+            target.path,
+            line=target.line_range[0],
+            before=20,
+            after=80,
+        )
+        ctx: RepoContext = state["repo_context"]
+        plan_text = "\n".join(f"{s.number}. {s.description}" for s in state.get("plan", []))
+        style_notes = "\n".join(f"- {n}" for n in ctx.style_notes[:6]) or "(none)"
+        failing_test_section = ""
+        if state.get("failing_test_output"):
+            failing_test_section = (
+                "\n# Failing test (must pass after your fix)\n"
+                f"{(state['failing_test_output'] or '')[-1500:]}\n"
+            )
+        user = (
+            f"# Plan\n{plan_text}\n\n"
+            f"# Target\n{target.path} L{target.line_range[0]}-{target.line_range[1]} :: {target.why}\n\n"
+            f"# File window\n```\n{window}\n```\n\n"
+            f"# Style notes\n{style_notes}\n"
+            f"{failing_test_section}"
+        )
+        msg = await llm.ainvoke(
+            [
+                SystemMessage(content=IMPLEMENT_SYSTEM),
+                HumanMessage(content=user),
+            ]
+        )
+        text = _as_text(msg.content).strip()
+        if text.startswith("```"):
+            text = text.split("\n", 1)[1] if "\n" in text else text
+            text = text.rsplit("```", 1)[0]
+        return {"patch": text.strip()}
+
+    return implement_node
+
+
+# ── add_test node (TEST_GAP only) ───────────────────────────────────────
+
+ADD_TEST_SYSTEM = """You are the Test Writer. Write a pytest test (or tests)
+covering the public symbol(s) the issue identifies as untested.
+
+Output STRICT JSON:
+{"test_path": "tests/<file>.py",
+ "test_code": "<full file contents>",
+ "append_only": true | false}    // true = append to existing file
+"""
+
+
+def make_add_test_node(llm: BaseChatModel) -> NodeFn:
+    async def add_test_node(state: AgentState) -> dict[str, Any]:
+        ctx: RepoContext = state["repo_context"]
+        target = state["target_files"][0]
+        user = (
+            f"# Symbol(s) to cover\n{target.path}:{target.line_range[0]}-{target.line_range[1]}\n"
+            f"why: {target.why}\n\n"
+            f"# Sample test file\n{ctx.sample_test_excerpt}\n\n"
+            f"# Test patterns\n{chr(10).join('- ' + p for p in ctx.test_patterns[:4]) or '(none)'}\n"
+        )
+        msg = await llm.ainvoke(
+            [
+                SystemMessage(content=ADD_TEST_SYSTEM),
+                HumanMessage(content=user),
+            ]
+        )
+        try:
+            data = json.loads(_as_text(msg.content))
+        except (json.JSONDecodeError, KeyError, ValueError):
+            return {"skip_reason": "add_test_parse_failed"}
+
+        repo_path = state["repo_path"]
+        tp = repo_path / data["test_path"]
+        tp.parent.mkdir(parents=True, exist_ok=True)
+        if data.get("append_only") and tp.exists():
+            with tp.open("a") as f:
+                f.write("\n\n" + data["test_code"])
+        else:
+            tp.write_text(data["test_code"])
+        return {}
+
+    return add_test_node
