@@ -37,7 +37,7 @@ async def handle_telegram_callback(
         # Lazy import to avoid pulling Modal into webhook unit tests, and to
         # break the circular link with src/ossagent/app.py which imports this
         # module in its FastAPI route.
-        from ossagent.app import push_and_open_pr_fn  # type: ignore[attr-defined]
+        from ossagent.app import push_and_open_pr_fn
 
         push_and_open_pr_fn.spawn(attempt_id=attempt_id)
     elif action == "reject":
